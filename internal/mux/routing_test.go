@@ -59,6 +59,92 @@ func TestModelHelpersUseConcreteModelIdentifier(t *testing.T) {
 	}
 }
 
+func TestModelRequirementUsesCurrentTurnAndCollaborationOverrides(t *testing.T) {
+	stored := modelRequirement{Model: "old-model", Effort: "high", ServiceTier: "default"}
+	requested := modelRequirementFromParams(json.RawMessage(`{
+		"model":"new-model",
+		"effort":"medium",
+		"serviceTier":"priority",
+		"collaborationMode":{"mode":"default","settings":{"model":"collab-model","reasoning_effort":"xhigh"}}
+	}`))
+	effective := stored.overlay(requested)
+	if effective.Model != "collab-model" || effective.Effort != "xhigh" || effective.ServiceTier != "priority" {
+		t.Fatalf("current-turn overrides did not win: %#v", effective)
+	}
+}
+
+func TestFailoverParamsCarryStickyModelSubCapabilities(t *testing.T) {
+	params := paramsWithModelRequirement(
+		json.RawMessage(`{"threadId":"thread-1","input":[]}`),
+		modelRequirement{Model: "daybreak-blue", Effort: "xhigh", ServiceTier: "priority"},
+	)
+	requirement := modelRequirementFromParams(params)
+	if requirement.Model != "daybreak-blue" || requirement.Effort != "xhigh" || requirement.ServiceTier != "priority" {
+		t.Fatalf("failover turn lost sticky capability settings: %s", params)
+	}
+	if threadIDFromParams(params) != "thread-1" {
+		t.Fatalf("failover parameter rewrite lost thread identity: %s", params)
+	}
+}
+
+func TestModelCapabilityChecksReasoningAndServiceTier(t *testing.T) {
+	models := []map[string]any{{
+		"model":  "daybreak-blue",
+		"hidden": true,
+		"supportedReasoningEfforts": []any{
+			map[string]any{"reasoningEffort": "high"},
+			map[string]any{"reasoningEffort": "xhigh"},
+		},
+		"serviceTiers": []any{map[string]any{"id": "priority"}},
+	}}
+	if !modelsSupportRequirement(models, modelRequirement{
+		Model: "daybreak-blue", Effort: "xhigh", ServiceTier: "priority",
+	}) {
+		t.Fatal("hidden model with the requested sub-capabilities was rejected")
+	}
+	if modelsSupportRequirement(models, modelRequirement{
+		Model: "daybreak-blue", Effort: "ultra", ServiceTier: "priority",
+	}) {
+		t.Fatal("unsupported reasoning effort was accepted")
+	}
+	if modelsSupportRequirement(models, modelRequirement{
+		Model: "daybreak-blue", Effort: "xhigh", ServiceTier: "flex",
+	}) {
+		t.Fatal("unsupported service tier was accepted")
+	}
+}
+
+func TestMergeModelCapabilitiesUnionsAccountCatalogs(t *testing.T) {
+	target := map[string]any{
+		"supportedReasoningEfforts": []any{map[string]any{"reasoningEffort": "high"}},
+		"serviceTiers":              []any{map[string]any{"id": "default"}},
+		"additionalSpeedTiers":      []any{"fast"},
+	}
+	source := map[string]any{
+		"supportedReasoningEfforts": []any{map[string]any{"reasoningEffort": "xhigh"}},
+		"serviceTiers":              []any{map[string]any{"id": "priority"}},
+		"additionalSpeedTiers":      []any{"fast", "faster"},
+	}
+	mergeModelCapabilities(target, source)
+	if len(anySlice(target["supportedReasoningEfforts"])) != 2 ||
+		len(anySlice(target["serviceTiers"])) != 2 ||
+		len(anySlice(target["additionalSpeedTiers"])) != 2 {
+		t.Fatalf("model sub-capabilities were not unioned: %#v", target)
+	}
+}
+
+func TestPaginatedHistoryFailsClosedForCrossProcessFailover(t *testing.T) {
+	if historyModeSupportsCrossProcessFailover("paginated") {
+		t.Fatal("paginated history was allowed to race two app-server writers")
+	}
+	if historyModeSupportsCrossProcessFailover("future-mode") {
+		t.Fatal("unknown history mode should fail closed")
+	}
+	if !historyModeSupportsCrossProcessFailover("legacy") {
+		t.Fatal("legacy rollout history should remain eligible for failover")
+	}
+}
+
 func TestAllSubscriptionsDepletedUsesActionableMessage(t *testing.T) {
 	message := allSubscriptionsDepleted(json.RawMessage(`7`), nil)
 	if message.Error == nil || message.Error.Code != -32026 {

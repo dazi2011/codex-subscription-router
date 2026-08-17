@@ -47,6 +47,50 @@ func TestLongestAndShortestWindowHandlesSingleWindow(t *testing.T) {
 	}
 }
 
+func TestRateLimitsRequireEveryAdvertisedWindowToHaveCapacity(t *testing.T) {
+	shortMinutes := int64(300)
+	weeklyMinutes := int64(10_080)
+	if rateLimitsHaveCapacity(&RateLimits{
+		Primary:   &RateLimitWindow{UsedPercent: 100, WindowDurationMins: &shortMinutes},
+		Secondary: &RateLimitWindow{UsedPercent: 20, WindowDurationMins: &weeklyMinutes},
+	}) {
+		t.Fatal("short-window exhaustion was treated as available capacity")
+	}
+	if !rateLimitsHaveCapacity(&RateLimits{
+		Primary:   &RateLimitWindow{UsedPercent: 50, WindowDurationMins: &shortMinutes},
+		Secondary: &RateLimitWindow{UsedPercent: 20, WindowDurationMins: &weeklyMinutes},
+	}) {
+		t.Fatal("account with capacity in both windows was rejected")
+	}
+}
+
+func TestDataBoundarySeparatesOrganizationsAndPersonalPlans(t *testing.T) {
+	personal := AccountSnapshot{PlanType: "plus", WorkspaceID: "personal-a"}
+	personalPro := AccountSnapshot{PlanType: "pro", WorkspaceID: "personal-b"}
+	business := AccountSnapshot{PlanType: "business", WorkspaceID: "workspace-a"}
+	businessSame := AccountSnapshot{PlanType: "team", WorkspaceID: "workspace-a"}
+	businessOther := AccountSnapshot{PlanType: "business", WorkspaceID: "workspace-b"}
+	enterprise := AccountSnapshot{PlanType: "enterprise", WorkspaceID: "workspace-a"}
+	if !sameDataBoundary(personal, personalPro) {
+		t.Fatal("personal subscriptions in the explicit pool should remain compatible")
+	}
+	if sameDataBoundary(personal, business) {
+		t.Fatal("personal and business subscriptions shared a data boundary")
+	}
+	if !sameDataBoundary(business, businessSame) {
+		t.Fatal("the same business workspace was rejected")
+	}
+	if sameDataBoundary(business, businessOther) || sameDataBoundary(business, enterprise) {
+		t.Fatal("cross-workspace or cross-plan-class migration was allowed")
+	}
+	if sameDataBoundary(
+		AccountSnapshot{PlanType: "business"},
+		AccountSnapshot{PlanType: "business"},
+	) {
+		t.Fatal("organization migration was allowed without a verified workspace ID")
+	}
+}
+
 func TestAggregateRateLimitsKeepsPoolAvailable(t *testing.T) {
 	weeklyMinutes := int64(10_080)
 	limits, err := aggregateRateLimits([]AccountSnapshot{

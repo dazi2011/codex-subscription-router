@@ -36,7 +36,9 @@ func TestStoreBootstrapsPrimaryAndPersistsThreadAffinity(t *testing.T) {
 	if err := store.SetThreadOwner("thread-1", added.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.SetThreadModel("thread-1", "daybreak-blue"); err != nil {
+	if err := store.UpdateThreadCapability("thread-1", ThreadCapability{
+		Model: "daybreak-blue", Effort: "xhigh", ServiceTier: "priority",
+	}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -50,6 +52,9 @@ func TestStoreBootstrapsPrimaryAndPersistsThreadAffinity(t *testing.T) {
 	}
 	if model, ok := reopened.ThreadModel("thread-1"); !ok || model != "daybreak-blue" {
 		t.Fatalf("thread model was not persisted: model=%q ok=%v", model, ok)
+	}
+	if capability := reopened.ThreadCapability("thread-1"); capability.Effort != "xhigh" || capability.ServiceTier != "priority" {
+		t.Fatalf("thread sub-capabilities were not persisted: %#v", capability)
 	}
 }
 
@@ -202,14 +207,29 @@ func TestThreadOwnerCompareAndSwapAndAccountRemoval(t *testing.T) {
 	if err := store.CompareAndSwapThreadOwner("thread-1", first.ID, second.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.ReplaceThreadMetadata(map[string]string{"thread-1": first.ID}, nil); err != nil {
+	if err := store.SetThreadOwner("thread-2", first.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MergeThreadMetadata(map[string]string{"thread-1": first.ID}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if owner, _ := store.ThreadOwner("thread-1"); owner != second.ID {
 		t.Fatalf("history reconciliation stole migrated owner: %q", owner)
 	}
-	if err := store.CompareAndSwapThreadOwner("thread-1", first.ID, second.ID); err == nil {
+	if owner, _ := store.ThreadOwner("thread-2"); owner != first.ID {
+		t.Fatalf("filtered history reconciliation removed unseen owner: %q", owner)
+	}
+	if err := store.CompareAndSwapThreadOwner("thread-1", first.ID, second.ID); err != nil {
+		t.Fatalf("already-completed owner move should be idempotent: %v", err)
+	}
+	if err := store.CompareAndSwapThreadOwner("thread-1", first.ID, "primary"); err == nil {
 		t.Fatal("stale owner update unexpectedly succeeded")
+	}
+	if err := store.SetThreadOwnerIfAbsent("thread-1", first.ID); err != nil {
+		t.Fatal(err)
+	}
+	if owner, _ := store.ThreadOwner("thread-1"); owner != second.ID {
+		t.Fatalf("late thread/started notification stole migrated owner: %q", owner)
 	}
 	if _, err := store.RemoveAccount(second.ID); err != nil {
 		t.Fatal(err)

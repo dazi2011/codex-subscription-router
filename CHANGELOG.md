@@ -15,13 +15,23 @@ this project uses [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 - Aggregate model discovery across enabled subscriptions and constrain new
-  threads and failover to accounts that advertise the requested model.
-- Preserve each thread's concrete model across failover and serialize owner
-  migration with compare-and-swap and rollback semantics.
+  threads and failover to accounts that advertise the requested model,
+  reasoning effort, and service tier, including hidden catalog entries.
+- Return a usable model catalog when one secondary account fails, while
+  surfacing the partial-account failure through router events.
+- Preserve each thread's sticky model capabilities across failover, give the
+  current turn precedence over stored settings, and serialize owner migration
+  with notification-safe compare-and-swap and rollback semantics.
+- Treat either short- or long-window quota exhaustion as unavailable capacity.
+- Prevent cross-class and cross-workspace organization failover; Personal
+  subscriptions remain an explicitly shared pool.
+- Reject paginated-history failover explicitly because the current app-server
+  protocol has no verified operation for releasing its single-process writer.
 - Remove exited children from the live pool, restart enabled children, bound
   forwarded RPC lifetimes, and initialize accounts concurrently.
 - De-duplicate merged history without allowing stale account lists to steal a
-  migrated thread; reconcile deleted thread metadata after complete listings.
+  migrated thread; filtered and concurrent listings now merge metadata without
+  deleting unseen thread assignments.
 - Avoid replaying already-submitted turns after quota errors.
 - Roll back failed account creation, expose secondary account deletion, clean
   cancelled device-code accounts, and align enabled state with child lifetime.

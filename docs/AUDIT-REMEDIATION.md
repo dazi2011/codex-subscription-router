@@ -9,15 +9,18 @@ not mean the patched desktop has completed a new signed-app E2E run.
 
 - **1–5 — model-aware routing and failover.** `model/list` is aggregated and
   de-duplicated across enabled children. New-thread placement queries each
-  candidate's model list. Thread model is read, persisted, passed to
-  `thread/resume`, and required on the target account.
+  candidate's model list. Sticky model, reasoning-effort, and service-tier
+  settings are persisted from successful requests, passed to the target where
+  the protocol permits, and required in its catalog. Capability queries include
+  hidden models, and current-turn overrides take precedence over stored values.
 - **6–8 — child lifecycle.** Exited children leave the live map, outstanding
   forwarded requests fail explicitly, enabled children restart, and request
   paths can restart a child on demand. Disabled children are not started.
 - **9, 11–13 — failover/list races.** Fixed striped per-thread locks serialize
-  migration. Owner updates use compare-and-swap. History is de-duplicated by
-  thread ID, and Store reconciliation preserves an existing owner under the
-  same lock used to write state.
+  migration. Owner updates use idempotent compare-and-swap, while asynchronous
+  `thread/started` notifications only fill an absent owner. History is
+  de-duplicated by thread ID, and Store reconciliation preserves existing and
+  concurrently created owners under the same lock used to write state.
 - **14–15 — false quota retry.** Only the structured Codex subscription usage
   code (or an exact top-level usage-limit message) is classified. A submitted
   turn is never replayed after its response, eliminating duplicate external
@@ -41,10 +44,12 @@ not mean the patched desktop has completed a new signed-app E2E run.
 - **51–55 — initialization and route lifetime.** Child initialization is
   concurrent under one pool timeout. Desktop-to-child and child-to-desktop
   routes expire. Child exit fails desktop requests that were awaiting it.
-- **56–60, 63 — history metadata lifecycle.** A complete history aggregation
-  reconciles owner/model maps once, prunes missing threads, avoids unchanged
-  state writes, and reports any incomplete child history instead of silently
-  returning a partial list.
+- **56–60, 63 — history metadata lifecycle.** History aggregation consumes all
+  pages for the requested query, reconciles owner/model maps once, avoids
+  unchanged state writes, and reports an incomplete child history instead of
+  silently returning a partial list. Because `thread/list` can be filtered and
+  is not an authoritative global inventory, reconciliation never prunes unseen
+  metadata.
 - **65 — duplicate account refresh.** The renderer uses one reconnecting SSE
   stream and event-triggered refresh rather than SSE plus a 30-second poll,
   warm-up poll, and loading-deadline poll.
@@ -54,7 +59,13 @@ not mean the patched desktop has completed a new signed-app E2E run.
 - **71–78 — enabled, healthy, and quota-unknown state.** Controller selection
   skips disabled accounts, disabling stops the child, startup skips disabled
   accounts, snapshots expose process/RPC health separately from login state,
-  and missing weekly quota is not treated as available capacity.
+  missing quota is not treated as capacity, and exhaustion in either advertised
+  short or long window makes the account unavailable.
+
+- **Follow-up model/catalog findings.** One failed secondary `model/list` now
+  produces a partial union instead of failing the whole selector. Duplicate
+  model entries union advertised reasoning and service-tier options. Existing
+  threads re-check an explicit model/tier change before forwarding.
 
 ## Mitigated, not transactional or independently verified
 
@@ -64,6 +75,10 @@ not mean the patched desktop has completed a new signed-app E2E run.
   back when the target send fails synchronously. A crash after a successful
   send remains an ambiguous distributed outcome; the target retains the
   resumed thread and the request fails explicitly rather than being replayed.
+- **Paginated history single-writer rule.** Cross-process migration is rejected
+  before target resume. The verified app-server schema exposes
+  `thread/unsubscribe`, but does not specify it as a writer-release operation;
+  using it as one would be an unsafe protocol guess.
 - **24 — hostile process on port 48123.** The mux now binds before starting
   children and exits if it cannot own the port. The renderer still contains
   the token by design, so a renderer that continues running after app-server
@@ -100,12 +115,16 @@ not mean the patched desktop has completed a new signed-app E2E run.
   updater remains disabled because an upstream update would erase or break the
   version-specific patch.
 - **45–50 — absolute capacity and identity compatibility.** The app-server
-  provides relative percentages, not a stable absolute quota unit.
-  Workspace/organization identity, plugin OAuth, MCP OAuth, and project trust
-  are account-local and are not exposed as a complete portable capability
-  contract. Model compatibility is enforced; the other boundaries cannot be
-  inferred safely. Users should pool only accounts they consider equivalent
-  for data and tool access.
+  provides relative percentages, not a stable absolute quota unit. Automatic
+  failover now separates Personal, Business/Team, Enterprise, and Education;
+  organization plans additionally require the same local ChatGPT workspace ID.
+  Plugin OAuth, MCP OAuth, and project trust remain account-local and are not
+  exposed as a complete portable capability contract. Users should still pool
+  only accounts they consider equivalent for tool access.
+- **Filtered-history garbage collection.** Retaining unseen metadata is the
+  safe choice for filtered and concurrent `thread/list` calls, but stale owner
+  entries cannot be collected until the upstream protocol exposes a complete,
+  authoritative inventory or an explicit deletion signal.
 - **66–68 — OAuth and shared-secret boundary.** Profile/reset features still
   read the account's local OAuth file to call the documented version-sensitive
   ChatGPT endpoints, and managed MCP/plugin config can contain inline secrets.

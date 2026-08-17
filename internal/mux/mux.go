@@ -246,7 +246,7 @@ func (m *Multiplexer) handleClientNotification(message protocol.Message) {
 func (m *Multiplexer) routeNewThread(message protocol.Message) {
 	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
 	defer cancel()
-	account, reason, err := m.chooseAccountForModel(ctx, modelFromParams(message.Params))
+	account, reason, err := m.chooseAccountForRequirement(ctx, modelRequirementFromParams(message.Params))
 	if err != nil {
 		if errors.Is(err, errNoSubscriptionCapacity) {
 			m.write(m.allSubscriptionsDepleted(ctx, message.ID))
@@ -366,14 +366,27 @@ func (m *Multiplexer) routeTurnStart(message protocol.Message, threadID, ownerID
 	ctx, cancel := context.WithTimeout(context.Background(), 2*requestTimeout)
 	defer cancel()
 	snapshot, err := m.accountSnapshotWithProfile(ctx, ownerID, false)
-	if err == nil && accountHasCapacity(snapshot) {
+	requested := modelRequirementFromParams(message.Params)
+	stored := m.store.ThreadCapability(threadID)
+	effective := modelRequirement{
+		Model: stored.Model, Effort: stored.Effort, ServiceTier: stored.ServiceTier,
+	}.overlay(requested)
+	ownerSupportsRequest := true
+	if err == nil && !requested.empty() {
+		ownerSupportsRequest, _ = m.accountSupportsRequirement(ctx, snapshot, effective)
+	}
+	if err == nil && accountHasCapacity(snapshot) && ownerSupportsRequest {
 		if err := m.forward(ownerID, message); err != nil {
 			m.write(protocol.Failure(message.ID, -32023, err.Error()))
 		}
 		return
 	}
 	excluded := map[string]struct{}{ownerID: {}}
-	m.failoverTurn(ctx, message, threadID, ownerID, excluded)
+	var source *AccountSnapshot
+	if err == nil {
+		source = &snapshot
+	}
+	m.failoverTurn(ctx, message, threadID, ownerID, excluded, source)
 }
 
 func (m *Multiplexer) failoverTurn(
@@ -382,28 +395,41 @@ func (m *Multiplexer) failoverTurn(
 	threadID string,
 	sourceAccountID string,
 	excluded map[string]struct{},
+	source *AccountSnapshot,
 ) {
+	if source == nil {
+		m.write(protocol.Failure(message.ID, -32031, "cannot establish the source account data boundary for safe failover"))
+		return
+	}
 	resume, err := m.readThreadResumeInfo(ctx, threadID, sourceAccountID)
 	if err != nil {
 		m.write(protocol.Failure(message.ID, -32027, fmt.Sprintf("read chat before failover: %v", err)))
 		return
 	}
-	requiredModel, _ := m.store.ThreadModel(threadID)
-	if resume.Model != "" {
-		requiredModel = resume.Model
-	} else if requiredModel == "" {
-		requiredModel = modelFromParams(message.Params)
+	if !historyModeSupportsCrossProcessFailover(resume.HistoryMode) {
+		m.write(protocol.Failure(
+			message.ID,
+			-32027,
+			"paginated chat cannot be failed over safely: the app-server protocol exposes no verified cross-process write-owner release operation",
+		))
+		return
 	}
-	if requiredModel != "" {
-		resume.Model = requiredModel
-		if err := m.store.SetThreadModel(threadID, requiredModel); err != nil {
-			m.write(protocol.Failure(message.ID, -32028, err.Error()))
-			return
-		}
+	stored := m.store.ThreadCapability(threadID)
+	requirement := modelRequirement{
+		Model: stored.Model, Effort: stored.Effort, ServiceTier: stored.ServiceTier,
+	}.overlay(modelRequirementFromParams(message.Params))
+	if requirement.Model == "" {
+		m.write(protocol.Failure(message.ID, -32031, errUnknownThreadModelCapability.Error()))
+		return
 	}
-	fallback, _, err := m.chooseAccountForModelExcluding(ctx, excluded, requiredModel)
+	resume.Model = requirement.Model
+	resume.ServiceTier = requirement.ServiceTier
+	fallback, _, err := m.chooseAccountForRequirementExcluding(ctx, excluded, requirement, source)
 	if err != nil {
-		if errors.Is(err, errNoModelCapableSubscription) {
+		if errors.Is(err, errNoModelCapableSubscription) ||
+			errors.Is(err, errModelCapabilityUnavailable) ||
+			errors.Is(err, errNoDataBoundarySubscription) ||
+			errors.Is(err, errUnknownThreadModelCapability) {
 			m.write(protocol.Failure(message.ID, -32031, err.Error()))
 		} else {
 			m.write(m.allSubscriptionsDepleted(ctx, message.ID))
@@ -418,6 +444,7 @@ func (m *Multiplexer) failoverTurn(
 		m.write(protocol.Failure(message.ID, -32028, err.Error()))
 		return
 	}
+	message.Params = paramsWithModelRequirement(message.Params, requirement)
 	if err := m.forward(fallback.ID, message); err != nil {
 		if rollbackErr := m.store.CompareAndSwapThreadOwner(threadID, fallback.ID, sourceAccountID); rollbackErr != nil {
 			m.write(protocol.Failure(message.ID, -32023, fmt.Sprintf("%v; owner rollback failed: %v", err, rollbackErr)))
@@ -434,12 +461,18 @@ func (m *Multiplexer) failoverTurn(
 	})
 }
 
+func historyModeSupportsCrossProcessFailover(historyMode string) bool {
+	return historyMode == "" || historyMode == "legacy"
+}
+
 type threadResumeInfo struct {
 	ID            string
 	Path          string
 	CWD           string
 	Model         string
+	ServiceTier   string
 	ModelProvider string
+	HistoryMode   string
 }
 
 func (m *Multiplexer) readThreadResumeInfo(ctx context.Context, threadID, sourceAccountID string) (threadResumeInfo, error) {
@@ -447,7 +480,7 @@ func (m *Multiplexer) readThreadResumeInfo(ctx context.Context, threadID, source
 	if err != nil {
 		return threadResumeInfo{}, fmt.Errorf("source subscription is unavailable: %w", err)
 	}
-	readParams, _ := json.Marshal(map[string]any{"threadId": threadID, "includeTurns": true})
+	readParams, _ := json.Marshal(map[string]any{"threadId": threadID, "includeTurns": false})
 	readResponse, err := source.Request(ctx, "thread/read", readParams)
 	if err != nil {
 		return threadResumeInfo{}, fmt.Errorf("read existing chat: %w", err)
@@ -457,19 +490,22 @@ func (m *Multiplexer) readThreadResumeInfo(ctx context.Context, threadID, source
 			ID            string `json:"id"`
 			Path          string `json:"path"`
 			CWD           string `json:"cwd"`
-			Model         string `json:"model"`
 			ModelProvider string `json:"modelProvider"`
+			HistoryMode   string `json:"historyMode"`
 		} `json:"thread"`
 	}
 	if err := json.Unmarshal(readResponse.Result, &readResult); err != nil {
 		return threadResumeInfo{}, fmt.Errorf("decode existing chat: %w", err)
 	}
-	if readResult.Thread.ID == "" || readResult.Thread.Path == "" {
+	if readResult.Thread.ID == "" {
+		return threadResumeInfo{}, errors.New("existing chat has no thread ID")
+	}
+	if readResult.Thread.HistoryMode != "paginated" && readResult.Thread.Path == "" {
 		return threadResumeInfo{}, errors.New("existing chat has no resumable history path")
 	}
 	return threadResumeInfo{
 		ID: readResult.Thread.ID, Path: readResult.Thread.Path, CWD: readResult.Thread.CWD,
-		Model: readResult.Thread.Model, ModelProvider: readResult.Thread.ModelProvider,
+		ModelProvider: readResult.Thread.ModelProvider, HistoryMode: readResult.Thread.HistoryMode,
 	}, nil
 }
 
@@ -478,14 +514,15 @@ func (m *Multiplexer) resumeThreadOnAccount(ctx context.Context, info threadResu
 	if err != nil {
 		return fmt.Errorf("target subscription is unavailable: %w", err)
 	}
-	resumeParams, _ := json.Marshal(map[string]any{
-		"threadId":      info.ID,
-		"history":       nil,
-		"path":          info.Path,
-		"cwd":           info.CWD,
-		"model":         info.Model,
-		"modelProvider": info.ModelProvider,
-	})
+	params := map[string]any{"threadId": info.ID, "history": nil, "path": info.Path}
+	for key, value := range map[string]string{
+		"cwd": info.CWD, "model": info.Model, "serviceTier": info.ServiceTier, "modelProvider": info.ModelProvider,
+	} {
+		if value != "" {
+			params[key] = value
+		}
+	}
+	resumeParams, _ := json.Marshal(params)
 	if _, err := target.Request(ctx, "thread/resume", resumeParams); err != nil {
 		return fmt.Errorf("resume existing chat: %w", err)
 	}
@@ -539,7 +576,9 @@ func (m *Multiplexer) handleInbound(inbound backend.Inbound) {
 					Message:   "Subscription depleted after the turn was submitted; the turn was not replayed",
 				})
 			}
-			m.learnThreadOwner(route, inbound.AccountID, message.Result)
+			if message.Error == nil {
+				m.learnThreadOwner(route, inbound.AccountID, message.Result)
+			}
 			m.writeRaw(inbound.Raw)
 		}
 		return
@@ -554,7 +593,7 @@ func (m *Multiplexer) handleInbound(inbound backend.Inbound) {
 	}
 	if message.Method == "thread/started" {
 		if threadID := threadIDFromNotification(message.Params); threadID != "" {
-			_ = m.store.SetThreadOwner(threadID, inbound.AccountID)
+			_ = m.store.SetThreadOwnerIfAbsent(threadID, inbound.AccountID)
 		}
 	}
 	if message.Method == "turn/completed" ||
@@ -628,11 +667,21 @@ func (m *Multiplexer) learnThreadOwner(route externalRoute, accountID string, re
 	case "thread/start", "thread/fork", "thread/resume", "thread/unarchive":
 		if threadID := threadIDFromResult(result); threadID != "" {
 			_ = m.store.SetThreadOwner(threadID, accountID)
-			if model := modelFromParams(route.message.Params); model != "" {
-				_ = m.store.SetThreadModel(threadID, model)
-			}
+			m.learnThreadCapability(threadID, route.message.Params)
+		}
+	case "turn/start":
+		if threadID := threadIDFromParams(route.message.Params); threadID != "" {
+			_ = m.store.SetThreadOwner(threadID, accountID)
+			m.learnThreadCapability(threadID, route.message.Params)
 		}
 	}
+}
+
+func (m *Multiplexer) learnThreadCapability(threadID string, params json.RawMessage) {
+	requirement := modelRequirementFromParams(params)
+	_ = m.store.UpdateThreadCapability(threadID, state.ThreadCapability{
+		Model: requirement.Model, Effort: requirement.Effort, ServiceTier: requirement.ServiceTier,
+	})
 }
 
 func (m *Multiplexer) write(message protocol.Message) {
@@ -917,8 +966,7 @@ func accountHasCapacity(snapshot AccountSnapshot) bool {
 	if !snapshot.Enabled || !snapshot.Connected || snapshot.AuthType != "chatgpt" {
 		return false
 	}
-	weekly, _ := longestAndShortestWindow(snapshot.RateLimits)
-	return weekly != nil && weekly.UsedPercent < 100
+	return rateLimitsHaveCapacity(snapshot.RateLimits)
 }
 
 func isUsageLimitResponse(message protocol.Message) bool {

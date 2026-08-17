@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -28,10 +27,18 @@ type Account struct {
 }
 
 type persistedState struct {
-	Version     int               `json:"version"`
-	Accounts    []Account         `json:"accounts"`
-	ThreadOwner map[string]string `json:"threadOwner"`
-	ThreadModel map[string]string `json:"threadModel,omitempty"`
+	Version           int               `json:"version"`
+	Accounts          []Account         `json:"accounts"`
+	ThreadOwner       map[string]string `json:"threadOwner"`
+	ThreadModel       map[string]string `json:"threadModel,omitempty"`
+	ThreadEffort      map[string]string `json:"threadEffort,omitempty"`
+	ThreadServiceTier map[string]string `json:"threadServiceTier,omitempty"`
+}
+
+type ThreadCapability struct {
+	Model       string
+	Effort      string
+	ServiceTier string
 }
 
 // Store persists only routing metadata. OAuth credentials and conversation
@@ -44,6 +51,8 @@ type Store struct {
 	accounts         []Account
 	owners           map[string]string
 	models           map[string]string
+	efforts          map[string]string
+	serviceTiers     map[string]string
 	configMu         sync.Mutex
 	managedConfigSum [sha256.Size]byte
 	hasManagedSum    bool
@@ -66,6 +75,8 @@ func Open(root, primaryCodexHome string) (*Store, error) {
 		primaryCodexHome: primaryCodexHome,
 		owners:           make(map[string]string),
 		models:           make(map[string]string),
+		efforts:          make(map[string]string),
+		serviceTiers:     make(map[string]string),
 	}
 	data, err := os.ReadFile(store.path)
 	switch {
@@ -83,6 +94,12 @@ func Open(root, primaryCodexHome string) (*Store, error) {
 		}
 		if persisted.ThreadModel != nil {
 			store.models = persisted.ThreadModel
+		}
+		if persisted.ThreadEffort != nil {
+			store.efforts = persisted.ThreadEffort
+		}
+		if persisted.ThreadServiceTier != nil {
+			store.serviceTiers = persisted.ThreadServiceTier
 		}
 	case errors.Is(err, os.ErrNotExist):
 		store.accounts = []Account{{
@@ -243,9 +260,13 @@ func (s *Store) RemoveAccount(id string) (Account, error) {
 	previousAccounts := s.accounts
 	previousOwners := s.owners
 	previousModels := s.models
+	previousEfforts := s.efforts
+	previousServiceTiers := s.serviceTiers
 	s.accounts = append(slices.Clone(s.accounts[:index]), s.accounts[index+1:]...)
 	s.owners = make(map[string]string, len(previousOwners))
 	s.models = make(map[string]string, len(previousModels))
+	s.efforts = make(map[string]string, len(previousEfforts))
+	s.serviceTiers = make(map[string]string, len(previousServiceTiers))
 	for threadID, accountID := range previousOwners {
 		if accountID != id {
 			s.owners[threadID] = accountID
@@ -256,10 +277,22 @@ func (s *Store) RemoveAccount(id string) (Account, error) {
 			s.models[threadID] = model
 		}
 	}
+	for threadID, effort := range previousEfforts {
+		if _, exists := s.owners[threadID]; exists {
+			s.efforts[threadID] = effort
+		}
+	}
+	for threadID, serviceTier := range previousServiceTiers {
+		if _, exists := s.owners[threadID]; exists {
+			s.serviceTiers[threadID] = serviceTier
+		}
+	}
 	if err := s.saveLocked(); err != nil {
 		s.accounts = previousAccounts
 		s.owners = previousOwners
 		s.models = previousModels
+		s.efforts = previousEfforts
+		s.serviceTiers = previousServiceTiers
 		return Account{}, err
 	}
 	if err := os.RemoveAll(accountRoot); err != nil {
@@ -324,6 +357,25 @@ func (s *Store) SetThreadOwner(threadID, accountID string) error {
 	return nil
 }
 
+// SetThreadOwnerIfAbsent learns ownership from asynchronous notifications
+// without allowing a late notification to steal an existing assignment.
+func (s *Store) SetThreadOwnerIfAbsent(threadID, accountID string) error {
+	if threadID == "" || accountID == "" {
+		return errors.New("thread and account IDs are required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.owners[threadID] != "" {
+		return nil
+	}
+	s.owners[threadID] = accountID
+	if err := s.saveLocked(); err != nil {
+		delete(s.owners, threadID)
+		return err
+	}
+	return nil
+}
+
 func (s *Store) CompareAndSwapThreadOwner(threadID, oldAccountID, newAccountID string) error {
 	if threadID == "" || oldAccountID == "" || newAccountID == "" {
 		return errors.New("thread and account IDs are required")
@@ -331,6 +383,9 @@ func (s *Store) CompareAndSwapThreadOwner(threadID, oldAccountID, newAccountID s
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	current := s.owners[threadID]
+	if current == newAccountID {
+		return nil
+	}
 	if current != oldAccountID {
 		return fmt.Errorf("thread %q owner changed from %q to %q", threadID, oldAccountID, current)
 	}
@@ -350,56 +405,73 @@ func (s *Store) ThreadModel(threadID string) (string, bool) {
 }
 
 func (s *Store) SetThreadModel(threadID, model string) error {
-	if threadID == "" || model == "" {
+	if model == "" {
 		return errors.New("thread ID and model are required")
+	}
+	return s.UpdateThreadCapability(threadID, ThreadCapability{Model: model})
+}
+
+func (s *Store) ThreadCapability(threadID string) ThreadCapability {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return ThreadCapability{
+		Model:       s.models[threadID],
+		Effort:      s.efforts[threadID],
+		ServiceTier: s.serviceTiers[threadID],
+	}
+}
+
+// UpdateThreadCapability records only non-empty sticky overrides. Omitted turn
+// parameters keep the previous thread setting.
+func (s *Store) UpdateThreadCapability(threadID string, capability ThreadCapability) error {
+	if threadID == "" {
+		return errors.New("thread ID is required")
+	}
+	if capability.Model == "" && capability.Effort == "" && capability.ServiceTier == "" {
+		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.models[threadID] == model {
+	previousModels := mapsClone(s.models)
+	previousEfforts := mapsClone(s.efforts)
+	previousServiceTiers := mapsClone(s.serviceTiers)
+	changed := setNonEmpty(s.models, threadID, capability.Model)
+	changed = setNonEmpty(s.efforts, threadID, capability.Effort) || changed
+	changed = setNonEmpty(s.serviceTiers, threadID, capability.ServiceTier) || changed
+	if !changed {
 		return nil
 	}
-	previous, existed := s.models[threadID]
-	s.models[threadID] = model
 	if err := s.saveLocked(); err != nil {
-		if existed {
-			s.models[threadID] = previous
-		} else {
-			delete(s.models, threadID)
-		}
+		s.models = previousModels
+		s.efforts = previousEfforts
+		s.serviceTiers = previousServiceTiers
 		return err
 	}
 	return nil
 }
 
-func (s *Store) ReplaceThreadMetadata(owners, models map[string]string) error {
+// MergeThreadMetadata learns from a possibly filtered or stale thread/list
+// result. It deliberately never removes unseen threads or overwrites an owner
+// that may have moved concurrently.
+func (s *Store) MergeThreadMetadata(owners, models map[string]string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	previousOwners := s.owners
-	previousModels := s.models
-	s.owners = make(map[string]string, len(owners))
+	previousOwners := mapsClone(s.owners)
+	previousModels := mapsClone(s.models)
+	changed := false
 	for threadID, accountID := range owners {
-		if threadID != "" && accountID != "" {
-			if persistedOwner := previousOwners[threadID]; persistedOwner != "" {
-				s.owners[threadID] = persistedOwner
-			} else {
-				s.owners[threadID] = accountID
-			}
-		}
-	}
-	s.models = make(map[string]string, len(previousModels)+len(models))
-	for threadID, model := range previousModels {
-		if _, exists := s.owners[threadID]; exists {
-			s.models[threadID] = model
+		if threadID != "" && accountID != "" && s.owners[threadID] == "" {
+			s.owners[threadID] = accountID
+			changed = true
 		}
 	}
 	for threadID, model := range models {
-		if _, exists := s.owners[threadID]; exists && model != "" {
+		if _, exists := s.owners[threadID]; exists && model != "" && s.models[threadID] == "" {
 			s.models[threadID] = model
+			changed = true
 		}
 	}
-	if maps.Equal(previousOwners, s.owners) && maps.Equal(previousModels, s.models) {
-		s.owners = previousOwners
-		s.models = previousModels
+	if !changed {
 		return nil
 	}
 	if err := s.saveLocked(); err != nil {
@@ -408,6 +480,22 @@ func (s *Store) ReplaceThreadMetadata(owners, models map[string]string) error {
 		return err
 	}
 	return nil
+}
+
+func mapsClone(source map[string]string) map[string]string {
+	clone := make(map[string]string, len(source))
+	for key, value := range source {
+		clone[key] = value
+	}
+	return clone
+}
+
+func setNonEmpty(values map[string]string, key, value string) bool {
+	if value == "" || values[key] == value {
+		return false
+	}
+	values[key] = value
+	return true
 }
 
 func (s *Store) ThreadCounts() map[string]int {
@@ -422,10 +510,12 @@ func (s *Store) ThreadCounts() map[string]int {
 
 func (s *Store) saveLocked() error {
 	persisted := persistedState{
-		Version:     stateVersion,
-		Accounts:    s.accounts,
-		ThreadOwner: s.owners,
-		ThreadModel: s.models,
+		Version:           stateVersion,
+		Accounts:          s.accounts,
+		ThreadOwner:       s.owners,
+		ThreadModel:       s.models,
+		ThreadEffort:      s.efforts,
+		ThreadServiceTier: s.serviceTiers,
 	}
 	data, err := json.MarshalIndent(persisted, "", "  ")
 	if err != nil {

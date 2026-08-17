@@ -26,15 +26,35 @@ Once a thread ID is known, `state.json` persists its owner. Requests, responses,
 approvals, and notifications are rewritten only as needed to preserve one
 coherent desktop session.
 
-If the owner is depleted, the multiplexer resumes the rollout on an account
-with capacity that advertises the thread's concrete model. The model selector
-is the de-duplicated union of every enabled child's `model/list`; the same
-capability data constrains new-thread placement and failover. Thread owner and
-model metadata are persisted together. Per-thread locks serialize failover,
-and owner changes use compare-and-swap plus rollback when the target request
-cannot be sent. A quota error received after `turn/start` was submitted is not
-replayed, because the router cannot prove the failed turn had no external side
-effects. Threads do not migrate for ordinary load balancing.
+If the owner is depleted in either its short or long quota window, the
+multiplexer resumes the rollout on an account with capacity that advertises
+the thread's concrete model, reasoning effort, and service tier. Capability
+queries include hidden catalog entries. The model selector is the
+de-duplicated union of successful enabled-child `model/list` responses, and a
+single failed secondary no longer hides every other account's catalog.
+
+Thread owner, model, reasoning effort, and service tier metadata are persisted
+together. Explicit settings on the current turn override sticky values. A
+successful failover injects the effective values into the first target turn so
+the target does not silently fall back to different defaults. Per-thread locks
+serialize failover; asynchronous `thread/started` notifications can only learn
+a previously unknown owner, and owner changes use idempotent compare-and-swap
+plus rollback when the target request cannot be sent.
+
+Organization failover is allowed only inside the same verified workspace and
+plan class. Personal plans are treated as the explicitly shared personal pool;
+Business/Team, Enterprise, and Education are separate classes. Paginated
+threads fail closed instead of attempting cross-process migration because the
+current app-server schema exposes no verified operation that releases the
+single-process writer. A quota error received after `turn/start` was submitted
+is not replayed, because the router cannot prove the failed turn had no
+external side effects. Threads do not migrate for ordinary load balancing.
+
+`thread/list` results are always treated as partial observations because the
+protocol supports search, working-directory, archive, source, and ancestry
+filters. The router merges newly observed ownership without pruning unseen
+metadata; this also prevents a stale listing from deleting a thread created
+while the listing was in flight.
 
 Child exit removes that process from the live map, fails outstanding desktop
 RPCs, and restarts the child while its account remains enabled. Forwarded RPC

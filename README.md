@@ -26,9 +26,10 @@ binaries or a prebuilt application.
   sooner, with a bounded boost for accounts holding banked usage resets.
 - **Sticky conversations.** Once a thread is assigned, every follow-up returns
   to the same subscription unless that subscription is depleted.
-- **Automatic failover.** A depleted thread continues through another account
-  with quota and the same model capability; if the compatible pool is empty,
-  the app shows an explicit error.
+- **Guarded automatic failover.** A depleted legacy-history thread continues
+  through another account only when quota, model/reasoning/tier capability,
+  and the account data boundary are compatible; otherwise the app shows an
+  explicit error.
 - **Multi-account model discovery.** The model selector is the de-duplicated
   union of enabled subscriptions rather than the Primary account's list.
 - **Native account management.** The existing profile menu shows pooled usage,
@@ -204,7 +205,9 @@ starts another sign-in.
 | --- | --- |
 | New chat | Assigned by quota-at-risk, banked resets, and short-window pressure |
 | Follow-up | Sent to the thread's persisted account owner |
-| Owner depleted | Continued through another account with capacity |
+| Either owner quota window depleted | Continued only through a capability- and data-boundary-compatible account |
+| Existing thread changes model/tier | Owner capability is rechecked; a compatible legacy thread can move |
+| Paginated thread needs failover | Rejected explicitly; no verified cross-process writer-release RPC exists |
 | Post-submit quota error | Original error returned without replaying side effects |
 | Every account depleted | Combined quota alert with the next known reset |
 | Account disabled | Excluded from routing and pooled usable quota |
@@ -291,10 +294,18 @@ The static-review remediation and remaining evidence boundaries are tracked in
 - Upstream ChatGPT updates can require new, reviewed patch anchors.
 - Quota percentages are not normalized into absolute capacity across Plus,
   Pro, Business, Enterprise, and Edu plans.
-- Workspace/organization identity, account-specific plugin OAuth, MCP OAuth,
-  and project trust are not portable capabilities. Automatic failover should
-  only be used between subscriptions the user considers an equivalent data and
-  tool boundary.
+- Personal plans form the explicitly shared Personal pool. Business/Team,
+  Enterprise, and Education failover requires the same verified workspace and
+  plan class. Account-specific plugin OAuth, MCP OAuth, and project trust are
+  still not a portable capability contract, so accounts inside an allowed pool
+  should still be equivalent for tool access.
+- Paginated-history threads cannot automatically fail over. The currently
+  verified app-server schema enforces a single process writer but exposes no
+  verified writer-release operation; the router fails closed instead of
+  racing two app-server processes.
+- Filtered `thread/list` results cannot prove deletion. Routing metadata is
+  therefore retained for unseen threads and may contain stale entries until a
+  future protocol supplies a complete authoritative inventory.
 - The injected renderer is trusted with the control API token; renderer code
   execution is therefore control API execution, not a separate security
   boundary.

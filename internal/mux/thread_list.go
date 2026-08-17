@@ -89,7 +89,7 @@ func (m *Multiplexer) aggregateThreadList(request protocol.Message) {
 		}
 	}
 	threads = append(threads, anonymous...)
-	if err := m.store.ReplaceThreadMetadata(owners, models); err != nil {
+	if err := m.store.MergeThreadMetadata(owners, models); err != nil {
 		m.write(protocol.Failure(request.ID, -32603, fmt.Sprintf("persist merged thread list: %v", err)))
 		return
 	}

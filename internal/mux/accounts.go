@@ -6,13 +6,18 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"path/filepath"
 	"sort"
 	"time"
 
 	"github.com/b-nnett/codex-subscription-router/internal/state"
 )
 
-var errNoSubscriptionCapacity = errors.New("no enabled ChatGPT subscription has capacity")
+var (
+	errNoSubscriptionCapacity       = errors.New("no enabled ChatGPT subscription has capacity")
+	errNoDataBoundarySubscription   = errors.New("no fallback subscription is inside the source account data boundary")
+	errUnknownThreadModelCapability = errors.New("thread model metadata is unavailable for safe failover")
+)
 
 const (
 	routingFallbackWindow      = 7 * 24 * time.Hour
@@ -50,6 +55,7 @@ type AccountSnapshot struct {
 	Error           string          `json:"error,omitempty"`
 	CreatedAt       int64           `json:"createdAt"`
 	RawAccount      json.RawMessage `json:"-"`
+	WorkspaceID     string          `json:"-"`
 }
 
 type RouteReason struct {
@@ -255,6 +261,9 @@ func (m *Multiplexer) accountSnapshotWithProfile(ctx context.Context, accountID 
 			snapshot.ProfileImageURL = m.profileImageURL(ctx, account)
 		}
 		if details.Type == "chatgpt" {
+			if credentials, authErr := readAuthFile(filepath.Join(account.CodexHome, "auth.json")); authErr == nil {
+				snapshot.WorkspaceID = credentials.Tokens.AccountID
+			}
 			rateResponse, rateErr := child.Request(ctx, "account/rateLimits/read", nil)
 			if rateErr == nil {
 				var rateResult struct {
@@ -296,14 +305,33 @@ func planLabel(planType string) string {
 }
 
 func (m *Multiplexer) chooseAccountForModel(ctx context.Context, model string) (state.Account, RouteReason, error) {
-	return m.chooseAccountForModelExcluding(ctx, nil, model)
+	return m.chooseAccountForRequirement(ctx, modelRequirement{Model: model})
 }
 
-func (m *Multiplexer) chooseAccountForModelExcluding(ctx context.Context, excluded map[string]struct{}, model string) (state.Account, RouteReason, error) {
+func (m *Multiplexer) chooseAccountForRequirement(
+	ctx context.Context,
+	requirement modelRequirement,
+) (state.Account, RouteReason, error) {
+	return m.chooseAccountForRequirementExcluding(ctx, nil, requirement, nil)
+}
+
+func (m *Multiplexer) chooseAccountForRequirementExcluding(
+	ctx context.Context,
+	excluded map[string]struct{},
+	requirement modelRequirement,
+	source *AccountSnapshot,
+) (state.Account, RouteReason, error) {
+	if requirement.Model == "" && (requirement.Effort != "" || requirement.ServiceTier != "") {
+		return state.Account{}, RouteReason{}, errUnknownThreadModelCapability
+	}
 	snapshots := m.accountSnapshots(ctx, false)
 	capable := make(map[string]bool)
-	if model != "" {
-		capable = m.modelCapableAccounts(ctx, snapshots, model)
+	if requirement.Model != "" {
+		var err error
+		capable, err = m.modelCapableAccounts(ctx, snapshots, requirement)
+		if err != nil {
+			return state.Account{}, RouteReason{}, err
+		}
 	}
 	type candidate struct {
 		account      state.Account
@@ -315,6 +343,8 @@ func (m *Multiplexer) chooseAccountForModelExcluding(ctx context.Context, exclud
 		urgency      float64
 	}
 	candidates := make([]candidate, 0, len(snapshots))
+	hasBoundaryCandidate := false
+	hasBoundaryCapability := false
 	for _, snapshot := range snapshots {
 		if _, skip := excluded[snapshot.ID]; skip {
 			continue
@@ -322,15 +352,20 @@ func (m *Multiplexer) chooseAccountForModelExcluding(ctx context.Context, exclud
 		if !snapshot.Enabled || !snapshot.Connected || snapshot.AuthType != "chatgpt" {
 			continue
 		}
-		if model != "" && !capable[snapshot.ID] {
+		if source != nil && !sameDataBoundary(*source, snapshot) {
 			continue
 		}
+		hasBoundaryCandidate = true
+		if requirement.Model != "" && !capable[snapshot.ID] {
+			continue
+		}
+		hasBoundaryCapability = true
 		account, ok := m.store.Account(snapshot.ID)
 		if !ok {
 			continue
 		}
 		weekly, short := longestAndShortestWindow(snapshot.RateLimits)
-		if weekly == nil || weekly.UsedPercent >= 100 {
+		if !rateLimitsHaveCapacity(snapshot.RateLimits) {
 			continue
 		}
 		weeklyUsed := 1_000.0
@@ -354,8 +389,11 @@ func (m *Multiplexer) chooseAccountForModelExcluding(ctx context.Context, exclud
 		})
 	}
 	if len(candidates) == 0 {
-		if model != "" && len(capable) == 0 {
-			return state.Account{}, RouteReason{}, fmt.Errorf("%w: %s", errNoModelCapableSubscription, model)
+		if source != nil && !hasBoundaryCandidate {
+			return state.Account{}, RouteReason{}, errNoDataBoundarySubscription
+		}
+		if requirement.Model != "" && !hasBoundaryCapability {
+			return state.Account{}, RouteReason{}, fmt.Errorf("%w: %s", errNoModelCapableSubscription, requirementDescription(requirement))
 		}
 		return state.Account{}, RouteReason{}, errNoSubscriptionCapacity
 	}
@@ -477,8 +515,7 @@ func aggregateRateLimits(snapshots []AccountSnapshot) (*RateLimits, error) {
 			primary = append(primary, snapshot.RateLimits.Primary)
 			secondary = append(secondary, snapshot.RateLimits.Secondary)
 		}
-		weekly, _ := longestAndShortestWindow(snapshot.RateLimits)
-		if weekly != nil && weekly.UsedPercent < 100 {
+		if rateLimitsHaveCapacity(snapshot.RateLimits) {
 			hasCapacity = true
 		}
 	}
@@ -493,6 +530,61 @@ func aggregateRateLimits(snapshots []AccountSnapshot) (*RateLimits, error) {
 		result.RateLimitReachedType = "rate_limit_reached"
 	}
 	return result, nil
+}
+
+func rateLimitsHaveCapacity(limits *RateLimits) bool {
+	if limits == nil || limits.RateLimitReachedType != nil {
+		return false
+	}
+	hasWindow := false
+	for _, window := range []*RateLimitWindow{limits.Primary, limits.Secondary} {
+		if window == nil {
+			continue
+		}
+		hasWindow = true
+		if window.UsedPercent >= 100 {
+			return false
+		}
+	}
+	return hasWindow
+}
+
+func sameDataBoundary(source, target AccountSnapshot) bool {
+	sourceClass := dataBoundaryClass(source.PlanType)
+	targetClass := dataBoundaryClass(target.PlanType)
+	if sourceClass == "personal" {
+		return targetClass == "personal"
+	}
+	if sourceClass == "" || targetClass != sourceClass {
+		return false
+	}
+	return source.WorkspaceID != "" && source.WorkspaceID == target.WorkspaceID
+}
+
+func dataBoundaryClass(planType string) string {
+	switch planType {
+	case "free", "go", "plus", "prolite", "pro":
+		return "personal"
+	case "team", "self_serve_business_prolite", "self_serve_business_usage_based", "business":
+		return "business"
+	case "ent26", "enterprise_cbp_automation", "enterprise_cbp_usage_based", "enterprise":
+		return "enterprise"
+	case "edu":
+		return "education"
+	default:
+		return ""
+	}
+}
+
+func requirementDescription(requirement modelRequirement) string {
+	description := requirement.Model
+	if requirement.Effort != "" {
+		description += " effort=" + requirement.Effort
+	}
+	if requirement.ServiceTier != "" {
+		description += " serviceTier=" + requirement.ServiceTier
+	}
+	return description
 }
 
 func averageRateLimitWindow(windows []*RateLimitWindow) *RateLimitWindow {
