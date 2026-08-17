@@ -16,6 +16,13 @@ type globalMutation struct {
 	params json.RawMessage
 }
 
+type globalStateTarget struct {
+	accountID  string
+	controller bool
+	child      *backend.Child
+	err        error
+}
+
 // Server-generated global identities stay in the Controller's state database.
 // Methods with thread-scoped state are deliberately excluded from this list.
 func controllerGlobalStateMethod(method string) bool {
@@ -38,39 +45,40 @@ func (m *Multiplexer) routeControllerRequest(message protocol.Message) {
 }
 
 // These mutations are safe to replicate because their identity and desired
-// value come from the client. Apply them to secondaries first, then return the
-// Controller's authoritative response only after every child accepted them.
+// value come from the client. Commit the Controller first, remember that
+// authoritative value, then update every Secondary. A Secondary with an
+// uncertain outcome is removed from routing and rebuilt from the journal.
 func (m *Multiplexer) broadcastGlobalMutation(message protocol.Message) {
 	accounts := m.store.Accounts()
-	type target struct {
-		accountID  string
-		controller bool
-		child      *backend.Child
-		err        error
+	controllerAccount, controllerConfigured := m.store.Controller()
+	if !controllerConfigured {
+		m.write(protocol.Failure(message.ID, -32022, "no controller account is configured"))
+		return
 	}
-	enabled := make([]target, 0, len(accounts))
+	enabled := make([]globalStateTarget, 0, len(accounts))
 	for _, account := range accounts {
 		if !account.Enabled {
 			continue
 		}
-		enabled = append(enabled, target{accountID: account.ID, controller: account.Controller})
+		enabled = append(enabled, globalStateTarget{accountID: account.ID, controller: account.ID == controllerAccount.ID})
 	}
 	if len(enabled) == 0 {
 		m.write(protocol.Failure(message.ID, -32022, "no controller account is configured"))
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), controlRequestTimeout)
-	defer cancel()
-	ensured := make(chan target, len(enabled))
+	ensureCtx, ensureCancel := context.WithTimeout(context.Background(), controlRequestTimeout)
+	defer ensureCancel()
+	ensured := make(chan globalStateTarget, len(enabled))
 	for _, candidate := range enabled {
-		go func(candidate target) {
-			candidate.child, candidate.err = m.ensureChild(ctx, candidate.accountID)
+		go func(candidate globalStateTarget) {
+			candidate.child, candidate.err = m.ensureChild(ensureCtx, candidate.accountID)
 			ensured <- candidate
 		}(candidate)
 	}
-	secondaries := make([]target, 0, len(enabled))
-	var controller *backend.Child
+	secondaries := make([]globalStateTarget, 0, len(enabled)-1)
+	var controller globalStateTarget
+	hasController := false
 	failed := make([]string, 0)
 	var firstErr error
 	for range enabled {
@@ -83,12 +91,13 @@ func (m *Multiplexer) broadcastGlobalMutation(message protocol.Message) {
 			continue
 		}
 		if candidate.controller {
-			controller = candidate.child
+			controller = candidate
+			hasController = true
 		} else {
 			secondaries = append(secondaries, candidate)
 		}
 	}
-	if controller == nil {
+	if !hasController {
 		if firstErr == nil {
 			firstErr = errors.New("controller app-server is unavailable")
 		}
@@ -102,58 +111,111 @@ func (m *Multiplexer) broadcastGlobalMutation(message protocol.Message) {
 		)))
 		return
 	}
+	ensureCancel()
 
 	m.globalApplyMu.Lock()
-	defer m.globalApplyMu.Unlock()
+	controllerCtx, controllerCancel := context.WithTimeout(context.Background(), controlRequestTimeout)
+	response, err := controller.child.Request(controllerCtx, message.Method, message.Params)
+	controllerCancel()
+	if err != nil {
+		m.globalApplyMu.Unlock()
+		var restoreErr error
+		if response.Error == nil {
+			// A timeout or transport failure has an uncertain commit outcome. A
+			// structured RPC rejection is definitive and leaves the child usable.
+			restoreErr = m.restoreGlobalStateChild(controller.accountID, controller.child)
+		}
+		m.publish(Event{
+			Type:    "global-state-sync-failed",
+			Message: "Controller rejected a process-wide app-server setting",
+			Data:    map[string]any{"method": message.Method},
+		})
+		if restoreErr != nil {
+			m.write(protocol.Failure(message.ID, -32037, fmt.Sprintf(
+				"Controller %s failed: %v; Controller baseline restore failed: %v", message.Method, err, restoreErr,
+			)))
+		} else {
+			m.write(protocol.Failure(message.ID, -32037, fmt.Sprintf("Controller %s failed: %v", message.Method, err)))
+		}
+		return
+	}
+	m.rememberGlobalMutation(message.Method, message.Params)
+
 	type result struct {
-		accountID string
-		err       error
+		target globalStateTarget
+		err    error
 	}
 	results := make(chan result, len(secondaries))
 	for _, candidate := range secondaries {
-		go func(candidate target) {
+		go func(candidate globalStateTarget) {
+			ctx, cancel := context.WithTimeout(context.Background(), controlRequestTimeout)
 			_, err := candidate.child.Request(ctx, message.Method, message.Params)
-			results <- result{accountID: candidate.accountID, err: err}
+			cancel()
+			results <- result{target: candidate, err: err}
 		}(candidate)
 	}
 	failed = failed[:0]
 	firstErr = nil
+	failedTargets := make([]globalStateTarget, 0)
 	for range secondaries {
 		result := <-results
 		if result.err != nil {
-			failed = append(failed, result.accountID)
+			failed = append(failed, result.target.accountID)
+			failedTargets = append(failedTargets, result.target)
 			if firstErr == nil {
 				firstErr = result.err
 			}
 		}
 	}
+	m.globalApplyMu.Unlock()
 	if len(failed) > 0 {
+		restoreErrors := m.restoreGlobalStateChildren(failedTargets)
+		eventType := "global-state-sync-recovered"
+		eventMessage := "Secondary app-servers were rebuilt from the authoritative process-wide state"
+		if len(restoreErrors) > 0 {
+			eventType = "global-state-sync-failed"
+			eventMessage = "Some Secondary app-servers could not be rebuilt from the authoritative process-wide state"
+		}
 		m.publish(Event{
-			Type:    "global-state-sync-failed",
-			Message: "A process-wide app-server setting was not accepted by every secondary",
+			Type:    eventType,
+			Message: eventMessage,
 			Data: map[string]any{
-				"method": message.Method, "failedAccountIds": failed,
+				"method": message.Method, "failedAccountIds": failed, "restoreErrors": restoreErrors,
 			},
 		})
-		m.write(protocol.Failure(message.ID, -32037, fmt.Sprintf(
-			"%s was not applied to every app-server; Controller was left unchanged: %v",
-			message.Method, firstErr,
-		)))
-		return
+		if len(restoreErrors) > 0 {
+			m.write(protocol.Failure(message.ID, -32037, fmt.Sprintf(
+				"Controller applied %s, but some Secondary app-servers could not be restored (%s): %v",
+				message.Method, strings.Join(failed, ", "), firstErr,
+			)))
+			return
+		}
 	}
+	m.write(protocol.Success(message.ID, response.Result))
+}
 
-	response, err := controller.Request(ctx, message.Method, message.Params)
-	if err == nil {
-		m.rememberGlobalMutation(message.Method, message.Params)
-		m.write(protocol.Success(message.ID, response.Result))
-		return
+func (m *Multiplexer) restoreGlobalStateChild(accountID string, child *backend.Child) error {
+	m.discardChild(accountID, child, "process-wide app-server state became uncertain")
+	account, ok := m.store.Account(accountID)
+	if !ok || !account.Enabled {
+		return nil
 	}
-	m.publish(Event{
-		Type:    "global-state-sync-failed",
-		Message: "Controller rejected a process-wide app-server setting after secondary synchronization",
-		Data:    map[string]any{"method": message.Method},
-	})
-	m.write(protocol.Failure(message.ID, -32037, fmt.Sprintf("Controller %s failed: %v", message.Method, err)))
+	ctx, cancel := context.WithTimeout(context.Background(), 2*controlRequestTimeout)
+	defer cancel()
+	if _, err := m.startChild(ctx, account); err != nil {
+		return fmt.Errorf("restart %s from the authoritative global-state journal: %w", accountID, err)
+	}
+	return nil
+}
+
+func (m *Multiplexer) restoreGlobalStateChildren(targets []globalStateTarget) map[string]string {
+	errorsByAccount := make(map[string]string)
+	for _, target := range targets {
+		if err := m.restoreGlobalStateChild(target.accountID, target.child); err != nil {
+			errorsByAccount[target.accountID] = err.Error()
+		}
+	}
+	return errorsByAccount
 }
 
 func (m *Multiplexer) rememberGlobalMutation(method string, params json.RawMessage) {
@@ -230,16 +292,26 @@ func (m *Multiplexer) replayGlobalMutations(parent context.Context, child *backe
 }
 
 func threadStartUsesControllerState(params json.RawMessage) bool {
+	usesProject, usesSection := threadStartControllerAffinity(params)
+	return usesProject || usesSection
+}
+
+func threadStartControllerAffinity(params json.RawMessage) (usesProject, usesSection bool) {
 	var decoded map[string]any
 	if json.Unmarshal(params, &decoded) != nil {
-		return false
+		return false, false
 	}
-	for _, key := range []string{"projectId", "project_id", "sectionId", "section_id"} {
+	for _, key := range []string{"projectId", "project_id"} {
 		if value, present := decoded[key]; present && value != nil && anyString(value) != "" {
-			return true
+			usesProject = true
 		}
 	}
-	return false
+	for _, key := range []string{"sectionId", "section_id"} {
+		if value, present := decoded[key]; present && value != nil && anyString(value) != "" {
+			usesSection = true
+		}
+	}
+	return usesProject, usesSection
 }
 
 func (m *Multiplexer) routeControllerAffinedThread(ctx context.Context, message protocol.Message) {
@@ -349,10 +421,7 @@ func (m *Multiplexer) aggregateLoadedThreadList(message protocol.Message) {
 }
 
 func listAllLoadedThreads(parent context.Context, entry childEntry, originalParams json.RawMessage) ([]string, error) {
-	var params map[string]any
-	if json.Unmarshal(originalParams, &params) != nil {
-		params = make(map[string]any)
-	}
+	params := mutableObjectParams(originalParams)
 	params["limit"] = 500
 	threadIDs := make([]string, 0)
 	seenCursors := make(map[string]struct{})

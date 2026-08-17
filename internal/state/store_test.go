@@ -1,6 +1,7 @@
 package state
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +10,40 @@ import (
 
 	"github.com/pelletier/go-toml/v2"
 )
+
+func TestLegacyControllerAffinityCanBeSpecializedAndCleared(t *testing.T) {
+	root := t.TempDir()
+	primaryHome := filepath.Join(root, "primary")
+	persisted := persistedState{
+		Version: stateVersion,
+		Accounts: []Account{{
+			ID: "primary", Label: "Primary", CodexHome: primaryHome,
+			Enabled: true, Controller: true,
+		}},
+		ThreadOwner:       map[string]string{"thread-1": "primary"},
+		ControllerThreads: map[string]bool{"thread-1": true},
+	}
+	data, err := json.Marshal(persisted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "state.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(root, primaryHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !store.ControllerAffinedThread("thread-1") {
+		t.Fatal("legacy affinity was not loaded")
+	}
+	if err := store.SetThreadSectionAffinity("thread-1", false); err != nil {
+		t.Fatal(err)
+	}
+	if store.ControllerAffinedThread("thread-1") {
+		t.Fatal("legacy section affinity could not be cleared")
+	}
+}
 
 func TestStoreBootstrapsPrimaryAndPersistsThreadAffinity(t *testing.T) {
 	root := t.TempDir()
@@ -195,6 +230,10 @@ func TestUpdateAccountPreservesController(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	secondary, err := store.AddAccount("Secondary")
+	if err != nil {
+		t.Fatal(err)
+	}
 	label := "Personal"
 	enabled := false
 	account, err := store.UpdateAccount("primary", &label, &enabled)
@@ -203,6 +242,39 @@ func TestUpdateAccountPreservesController(t *testing.T) {
 	}
 	if account.Label != label || account.Enabled || !account.Controller {
 		t.Fatalf("unexpected updated account: %#v", account)
+	}
+	controller, ok := store.Controller()
+	if !ok || controller.ID != secondary.ID {
+		t.Fatalf("enabled Secondary did not become the effective Controller: %#v ok=%v", controller, ok)
+	}
+}
+
+func TestThreadSectionAffinityCanBeLearnedClearedAndCopied(t *testing.T) {
+	root := t.TempDir()
+	store, err := Open(filepath.Join(root, "mux"), filepath.Join(root, "primary"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetThreadOwner("source", "primary"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MergeThreadMetadata(nil, nil, []string{"source"}); err != nil {
+		t.Fatal(err)
+	}
+	if !store.ControllerAffinedThread("source") {
+		t.Fatal("section affinity was not learned from thread metadata")
+	}
+	if err := store.CopyControllerAffinity("source", "fork"); err != nil {
+		t.Fatal(err)
+	}
+	if !store.ControllerAffinedThread("fork") {
+		t.Fatal("fork did not inherit Controller affinity")
+	}
+	if err := store.SetThreadSectionAffinity("source", false); err != nil {
+		t.Fatal(err)
+	}
+	if store.ControllerAffinedThread("source") {
+		t.Fatal("unsectioned thread remained permanently Controller-affined")
 	}
 }
 
@@ -229,7 +301,7 @@ func TestThreadOwnerCompareAndSwapAndAccountRemoval(t *testing.T) {
 	if err := store.SetThreadOwner("thread-2", first.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.MergeThreadMetadata(map[string]string{"thread-1": first.ID}, nil); err != nil {
+	if err := store.MergeThreadMetadata(map[string]string{"thread-1": first.ID}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if owner, _ := store.ThreadOwner("thread-1"); owner != second.ID {

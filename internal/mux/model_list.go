@@ -24,6 +24,14 @@ type modelRequirement struct {
 	ServiceTierKnown bool
 }
 
+type modelCapabilityState uint8
+
+const (
+	modelCapabilityUnknown modelCapabilityState = iota
+	modelCapabilitySupported
+	modelCapabilityUnsupported
+)
+
 func (requirement modelRequirement) empty() bool {
 	return !requirement.ModelKnown && !requirement.EffortKnown && !requirement.ServiceTierKnown
 }
@@ -142,12 +150,12 @@ func mergeModelCatalogs(catalogs [][]map[string]any) []map[string]any {
 	return merged
 }
 
-func (m *Multiplexer) modelCapableAccounts(
+func (m *Multiplexer) modelCapabilityStates(
 	ctx context.Context,
 	snapshots []AccountSnapshot,
 	requirement modelRequirement,
-) (map[string]bool, error) {
-	capable := make(map[string]bool)
+) map[string]modelCapabilityState {
+	states := make(map[string]modelCapabilityState)
 	type result struct {
 		accountID string
 		supports  bool
@@ -159,6 +167,7 @@ func (m *Multiplexer) modelCapableAccounts(
 		if !snapshot.Enabled || !snapshot.Connected || snapshot.AuthType != "chatgpt" {
 			continue
 		}
+		states[snapshot.ID] = modelCapabilityUnknown
 		child, ok := m.child(snapshot.ID)
 		if !ok {
 			continue
@@ -169,25 +178,18 @@ func (m *Multiplexer) modelCapableAccounts(
 			results <- result{accountID: accountID, supports: modelsSupportRequirement(models, requirement), err: err}
 		}(snapshot.ID, child)
 	}
-	succeeded := 0
-	var firstErr error
 	for range attempted {
 		result := <-results
 		if result.err != nil {
-			if firstErr == nil {
-				firstErr = result.err
-			}
 			continue
 		}
-		succeeded++
 		if result.supports {
-			capable[result.accountID] = true
+			states[result.accountID] = modelCapabilitySupported
+		} else {
+			states[result.accountID] = modelCapabilityUnsupported
 		}
 	}
-	if attempted > 0 && succeeded == 0 {
-		return capable, fmt.Errorf("%w: %v", errModelCapabilityUnavailable, firstErr)
-	}
-	return capable, nil
+	return states
 }
 
 func (m *Multiplexer) accountSupportsRequirement(
@@ -210,10 +212,7 @@ func (m *Multiplexer) accountSupportsRequirement(
 }
 
 func (m *Multiplexer) listAllModels(parent context.Context, child *backend.Child, originalParams json.RawMessage) ([]map[string]any, error) {
-	var params map[string]any
-	if len(originalParams) == 0 || json.Unmarshal(originalParams, &params) != nil {
-		params = make(map[string]any)
-	}
+	params := mutableObjectParams(originalParams)
 	params["limit"] = 500
 	models := make([]map[string]any, 0)
 	seenCursors := make(map[string]struct{})
@@ -267,9 +266,11 @@ func modelRequirementFromParams(params json.RawMessage) modelRequirement {
 	if config, ok := decoded["config"].(map[string]any); ok {
 		model, modelKnown := capabilityField(config, "model")
 		effort, effortKnown := capabilityField(config, "model_reasoning_effort")
+		serviceTier, serviceTierKnown := capabilityField(config, "service_tier")
 		requirement = modelRequirement{
 			Model: model, ModelKnown: modelKnown,
 			Effort: effort, EffortKnown: effortKnown,
+			ServiceTier: serviceTier, ServiceTierKnown: serviceTierKnown,
 		}
 	}
 	model, modelKnown := capabilityField(decoded, "model")

@@ -27,14 +27,21 @@ type Account struct {
 }
 
 type persistedState struct {
-	Version           int               `json:"version"`
-	Accounts          []Account         `json:"accounts"`
-	ThreadOwner       map[string]string `json:"threadOwner"`
-	ThreadModel       map[string]string `json:"threadModel,omitempty"`
-	ThreadEffort      map[string]string `json:"threadEffort,omitempty"`
-	ThreadServiceTier map[string]string `json:"threadServiceTier,omitempty"`
-	ControllerThreads map[string]bool   `json:"controllerThreads,omitempty"`
+	Version                 int               `json:"version"`
+	Accounts                []Account         `json:"accounts"`
+	ThreadOwner             map[string]string `json:"threadOwner"`
+	ThreadModel             map[string]string `json:"threadModel,omitempty"`
+	ThreadEffort            map[string]string `json:"threadEffort,omitempty"`
+	ThreadServiceTier       map[string]string `json:"threadServiceTier,omitempty"`
+	ControllerThreads       map[string]bool   `json:"controllerThreads,omitempty"`
+	ControllerThreadReasons map[string]uint8  `json:"controllerThreadReasons,omitempty"`
 }
+
+const (
+	controllerAffinityLegacy uint8 = 1 << iota
+	controllerAffinityState
+	controllerAffinitySection
+)
 
 type ThreadCapability struct {
 	Model            string
@@ -65,7 +72,7 @@ type Store struct {
 	models            map[string]string
 	efforts           map[string]string
 	serviceTiers      map[string]string
-	controllerThreads map[string]bool
+	controllerReasons map[string]uint8
 	configMu          sync.Mutex
 	managedConfigSum  [sha256.Size]byte
 	hasManagedSum     bool
@@ -90,7 +97,7 @@ func Open(root, primaryCodexHome string) (*Store, error) {
 		models:            make(map[string]string),
 		efforts:           make(map[string]string),
 		serviceTiers:      make(map[string]string),
-		controllerThreads: make(map[string]bool),
+		controllerReasons: make(map[string]uint8),
 	}
 	data, err := os.ReadFile(store.path)
 	switch {
@@ -115,8 +122,14 @@ func Open(root, primaryCodexHome string) (*Store, error) {
 		if persisted.ThreadServiceTier != nil {
 			store.serviceTiers = persisted.ThreadServiceTier
 		}
-		if persisted.ControllerThreads != nil {
-			store.controllerThreads = persisted.ControllerThreads
+		if persisted.ControllerThreadReasons != nil {
+			store.controllerReasons = persisted.ControllerThreadReasons
+		} else {
+			for threadID, affined := range persisted.ControllerThreads {
+				if affined {
+					store.controllerReasons[threadID] = controllerAffinityLegacy
+				}
+			}
 		}
 	case errors.Is(err, os.ErrNotExist):
 		store.accounts = []Account{{
@@ -279,13 +292,13 @@ func (s *Store) RemoveAccount(id string) (Account, error) {
 	previousModels := s.models
 	previousEfforts := s.efforts
 	previousServiceTiers := s.serviceTiers
-	previousControllerThreads := s.controllerThreads
+	previousControllerReasons := s.controllerReasons
 	s.accounts = append(slices.Clone(s.accounts[:index]), s.accounts[index+1:]...)
 	s.owners = make(map[string]string, len(previousOwners))
 	s.models = make(map[string]string, len(previousModels))
 	s.efforts = make(map[string]string, len(previousEfforts))
 	s.serviceTiers = make(map[string]string, len(previousServiceTiers))
-	s.controllerThreads = make(map[string]bool, len(previousControllerThreads))
+	s.controllerReasons = make(map[string]uint8, len(previousControllerReasons))
 	for threadID, accountID := range previousOwners {
 		if accountID != id {
 			s.owners[threadID] = accountID
@@ -306,9 +319,9 @@ func (s *Store) RemoveAccount(id string) (Account, error) {
 			s.serviceTiers[threadID] = serviceTier
 		}
 	}
-	for threadID, controllerAffined := range previousControllerThreads {
-		if _, exists := s.owners[threadID]; exists && controllerAffined {
-			s.controllerThreads[threadID] = true
+	for threadID, reasons := range previousControllerReasons {
+		if _, exists := s.owners[threadID]; exists && reasons != 0 {
+			s.controllerReasons[threadID] = reasons
 		}
 	}
 	if err := s.saveLocked(); err != nil {
@@ -317,7 +330,7 @@ func (s *Store) RemoveAccount(id string) (Account, error) {
 		s.models = previousModels
 		s.efforts = previousEfforts
 		s.serviceTiers = previousServiceTiers
-		s.controllerThreads = previousControllerThreads
+		s.controllerReasons = previousControllerReasons
 		return Account{}, err
 	}
 	if err := os.RemoveAll(accountRoot); err != nil {
@@ -454,21 +467,80 @@ func (s *Store) ThreadCapability(threadID string) ThreadCapability {
 func (s *Store) ControllerAffinedThread(threadID string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.controllerThreads[threadID]
+	return s.controllerReasons[threadID] != 0
 }
 
 func (s *Store) SetControllerAffinedThread(threadID string) error {
+	return s.setControllerAffinityReason(threadID, controllerAffinityState, true)
+}
+
+func (s *Store) SetThreadSectionAffinity(threadID string, affined bool) error {
+	return s.setControllerAffinityReason(threadID, controllerAffinitySection, affined)
+}
+
+func (s *Store) setControllerAffinityReason(threadID string, reason uint8, enabled bool) error {
 	if threadID == "" {
 		return errors.New("thread ID is required")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.controllerThreads[threadID] {
+	previous := s.controllerReasons[threadID]
+	next := previous
+	if reason == controllerAffinitySection && previous == controllerAffinityLegacy {
+		// The previous format used one boolean, and the current protocol exposes
+		// section membership as the only recoverable historical affinity. The
+		// first authoritative section operation specializes that legacy value.
+		if enabled {
+			next = controllerAffinitySection
+		} else {
+			next = 0
+		}
+	} else if enabled {
+		next |= reason
+	} else {
+		next &^= reason
+	}
+	if next == previous {
 		return nil
 	}
-	s.controllerThreads[threadID] = true
+	if next == 0 {
+		delete(s.controllerReasons, threadID)
+	} else {
+		s.controllerReasons[threadID] = next
+	}
 	if err := s.saveLocked(); err != nil {
-		delete(s.controllerThreads, threadID)
+		if previous == 0 {
+			delete(s.controllerReasons, threadID)
+		} else {
+			s.controllerReasons[threadID] = previous
+		}
+		return err
+	}
+	return nil
+}
+
+func (s *Store) CopyControllerAffinity(sourceThreadID, targetThreadID string) error {
+	if sourceThreadID == "" || targetThreadID == "" {
+		return errors.New("source and target thread IDs are required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	reasons := s.controllerReasons[sourceThreadID]
+	previous := s.controllerReasons[targetThreadID]
+	if previous == reasons {
+		return nil
+	}
+	if reasons == 0 {
+		delete(s.controllerReasons, targetThreadID)
+	} else {
+		s.controllerReasons[targetThreadID] = reasons
+	}
+	if err := s.saveLocked(); err != nil {
+		if previous == 0 {
+			delete(s.controllerReasons, targetThreadID)
+		} else {
+			s.controllerReasons[targetThreadID] = previous
+		}
 		return err
 	}
 	return nil
@@ -507,11 +579,12 @@ func (s *Store) UpdateThreadCapability(threadID string, capability ThreadCapabil
 // MergeThreadMetadata learns from a possibly filtered or stale thread/list
 // result. It deliberately never removes unseen threads or overwrites an owner
 // that may have moved concurrently.
-func (s *Store) MergeThreadMetadata(owners, models map[string]string) error {
+func (s *Store) MergeThreadMetadata(owners, models map[string]string, sectionThreadIDs []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	previousOwners := mapsClone(s.owners)
 	previousModels := mapsClone(s.models)
+	previousControllerReasons := uint8MapsClone(s.controllerReasons)
 	changed := false
 	for threadID, accountID := range owners {
 		if threadID != "" && accountID != "" && s.owners[threadID] == "" {
@@ -525,15 +598,40 @@ func (s *Store) MergeThreadMetadata(owners, models map[string]string) error {
 			changed = true
 		}
 	}
+	for _, threadID := range sectionThreadIDs {
+		if threadID == "" {
+			continue
+		}
+		previous := s.controllerReasons[threadID]
+		next := previous | controllerAffinitySection
+		if previous == controllerAffinityLegacy {
+			// Version 1 stored a single boolean. A positive section observation
+			// lets us safely specialize the common legacy section-only record.
+			next = controllerAffinitySection
+		}
+		if next != previous {
+			s.controllerReasons[threadID] = next
+			changed = true
+		}
+	}
 	if !changed {
 		return nil
 	}
 	if err := s.saveLocked(); err != nil {
 		s.owners = previousOwners
 		s.models = previousModels
+		s.controllerReasons = previousControllerReasons
 		return err
 	}
 	return nil
+}
+
+func uint8MapsClone(source map[string]uint8) map[string]uint8 {
+	clone := make(map[string]uint8, len(source))
+	for key, value := range source {
+		clone[key] = value
+	}
+	return clone
 }
 
 func mapsClone(source map[string]string) map[string]string {
@@ -566,14 +664,21 @@ func (s *Store) ThreadCounts() map[string]int {
 }
 
 func (s *Store) saveLocked() error {
+	controllerThreads := make(map[string]bool, len(s.controllerReasons))
+	for threadID, reasons := range s.controllerReasons {
+		if reasons != 0 {
+			controllerThreads[threadID] = true
+		}
+	}
 	persisted := persistedState{
-		Version:           stateVersion,
-		Accounts:          s.accounts,
-		ThreadOwner:       s.owners,
-		ThreadModel:       s.models,
-		ThreadEffort:      s.efforts,
-		ThreadServiceTier: s.serviceTiers,
-		ControllerThreads: s.controllerThreads,
+		Version:                 stateVersion,
+		Accounts:                s.accounts,
+		ThreadOwner:             s.owners,
+		ThreadModel:             s.models,
+		ThreadEffort:            s.efforts,
+		ThreadServiceTier:       s.serviceTiers,
+		ControllerThreads:       controllerThreads,
+		ControllerThreadReasons: s.controllerReasons,
 	}
 	data, err := json.MarshalIndent(persisted, "", "  ")
 	if err != nil {

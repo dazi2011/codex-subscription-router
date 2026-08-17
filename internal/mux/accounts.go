@@ -336,13 +336,9 @@ func (m *Multiplexer) chooseAccountForRequirementExcluding(
 		}
 	}
 	snapshots := m.accountSnapshots(ctx, false)
-	capable := make(map[string]bool)
+	capabilityStates := make(map[string]modelCapabilityState)
 	if requirement.Model != "" {
-		var err error
-		capable, err = m.modelCapableAccounts(ctx, snapshots, requirement)
-		if err != nil {
-			return state.Account{}, RouteReason{}, err
-		}
+		capabilityStates = m.modelCapabilityStates(ctx, snapshots, requirement)
 	}
 	type candidate struct {
 		account      state.Account
@@ -356,6 +352,7 @@ func (m *Multiplexer) chooseAccountForRequirementExcluding(
 	candidates := make([]candidate, 0, len(snapshots))
 	hasBoundaryCandidate := false
 	hasBoundaryCapability := false
+	hasBoundaryCapabilityUnknown := false
 	for _, snapshot := range snapshots {
 		if _, skip := excluded[snapshot.ID]; skip {
 			continue
@@ -367,8 +364,17 @@ func (m *Multiplexer) chooseAccountForRequirementExcluding(
 			continue
 		}
 		hasBoundaryCandidate = true
-		if requirement.Model != "" && !capable[snapshot.ID] {
-			continue
+		if requirement.Model != "" {
+			switch capabilityStates[snapshot.ID] {
+			case modelCapabilitySupported:
+			case modelCapabilityUnknown:
+				if accountQuotaState(snapshot) != quotaCapacityExhausted {
+					hasBoundaryCapabilityUnknown = true
+				}
+				continue
+			default:
+				continue
+			}
 		}
 		hasBoundaryCapability = true
 		account, ok := m.store.Account(snapshot.ID)
@@ -404,6 +410,11 @@ func (m *Multiplexer) chooseAccountForRequirementExcluding(
 			return state.Account{}, RouteReason{}, errNoDataBoundarySubscription
 		}
 		if requirement.Model != "" && !hasBoundaryCapability {
+			if hasBoundaryCapabilityUnknown {
+				return state.Account{}, RouteReason{}, fmt.Errorf(
+					"%w: %s", errModelCapabilityUnavailable, requirementDescription(requirement),
+				)
+			}
 			return state.Account{}, RouteReason{}, fmt.Errorf("%w: %s", errNoModelCapableSubscription, requirementDescription(requirement))
 		}
 		return state.Account{}, RouteReason{}, errNoSubscriptionCapacity

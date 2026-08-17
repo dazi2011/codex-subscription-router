@@ -1,10 +1,15 @@
 package mux
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,6 +17,178 @@ import (
 	"github.com/b-nnett/codex-subscription-router/internal/protocol"
 	"github.com/b-nnett/codex-subscription-router/internal/state"
 )
+
+func TestMuxDelayedInitializeHelperProcess(t *testing.T) {
+	if os.Getenv("CODEX_MUX_TEST_HELPER") != "1" {
+		return
+	}
+	scanner := bufio.NewScanner(os.Stdin)
+	for scanner.Scan() {
+		message, err := protocol.Parse(scanner.Bytes())
+		if err != nil {
+			continue
+		}
+		if eventLog := os.Getenv("CODEX_MUX_HELPER_EVENT_LOG"); eventLog != "" {
+			if file, openErr := os.OpenFile(eventLog, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600); openErr == nil {
+				_, _ = fmt.Fprintf(file, "%s\t%s\n", os.Getenv("CODEX_HOME"), message.Method)
+				_ = file.Close()
+			}
+		}
+		if message.Method == "initialize" && os.Getenv("CODEX_MUX_DELAY_INITIALIZE") == "1" {
+			time.Sleep(250 * time.Millisecond)
+		}
+		if len(message.ID) == 0 {
+			continue
+		}
+		response := protocol.Success(message.ID, json.RawMessage(`{}`))
+		if message.Method == "skills/extraRoots/set" && os.Getenv("CODEX_HOME") == os.Getenv("CODEX_MUX_FAIL_ONCE_HOME") {
+			marker := os.Getenv("CODEX_MUX_FAIL_ONCE_MARKER")
+			if file, createErr := os.OpenFile(marker, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600); createErr == nil {
+				_ = file.Close()
+				response = protocol.Failure(message.ID, -32000, "injected global mutation failure")
+			}
+		}
+		encoded, _ := protocol.Encode(response)
+		_, _ = os.Stdout.Write(append(encoded, '\n'))
+	}
+	os.Exit(0)
+}
+
+func TestStartChildPublishesOnlyAfterInitialization(t *testing.T) {
+	root := t.TempDir()
+	store, err := state.Open(filepath.Join(root, "mux"), filepath.Join(root, "primary"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	multiplexer, err := New(Options{
+		RealExecutable: os.Args[0],
+		RealArgs:       []string{"-test.run=TestMuxDelayedInitializeHelperProcess"},
+		Environment: append(os.Environ(),
+			"CODEX_MUX_TEST_HELPER=1",
+			"CODEX_MUX_DELAY_INITIALIZE=1",
+		),
+		Store: store, Output: &bytes.Buffer{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	multiplexer.initializeParams = json.RawMessage(`{"clientInfo":{"name":"test","version":"1"}}`)
+	multiplexer.initialized = true
+	account, _ := store.Account("primary")
+	type startResult struct {
+		child *backend.Child
+		err   error
+	}
+	result := make(chan startResult, 1)
+	go func() {
+		child, err := multiplexer.startChild(context.Background(), account)
+		result <- startResult{child: child, err: err}
+	}()
+	time.Sleep(50 * time.Millisecond)
+	if _, published := multiplexer.child(account.ID); published {
+		t.Fatal("initializing child was published as routable")
+	}
+	var started startResult
+	select {
+	case started = <-result:
+	case <-time.After(3 * time.Second):
+		t.Fatal("child did not finish initialization")
+	}
+	if started.err != nil || started.child == nil {
+		t.Fatalf("start child failed: %v", started.err)
+	}
+	if current, published := multiplexer.child(account.ID); !published || current != started.child {
+		t.Fatal("ready child was not published")
+	}
+	stopCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := multiplexer.stopChild(stopCtx, account.ID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGlobalMutationRecoversFailedSecondaryFromControllerJournal(t *testing.T) {
+	root := t.TempDir()
+	store, err := state.Open(filepath.Join(root, "mux"), filepath.Join(root, "primary"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondary, err := store.AddAccount("Secondary")
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventLog := filepath.Join(root, "events.log")
+	failMarker := filepath.Join(root, "failed-once")
+	output := &bytes.Buffer{}
+	multiplexer, err := New(Options{
+		RealExecutable: os.Args[0],
+		RealArgs:       []string{"-test.run=TestMuxDelayedInitializeHelperProcess"},
+		Environment: append(os.Environ(),
+			"CODEX_MUX_TEST_HELPER=1",
+			"CODEX_MUX_HELPER_EVENT_LOG="+eventLog,
+			"CODEX_MUX_FAIL_ONCE_HOME="+secondary.CodexHome,
+			"CODEX_MUX_FAIL_ONCE_MARKER="+failMarker,
+		),
+		Store: store, Output: output,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lifecycle, cancelLifecycle := context.WithCancel(context.Background())
+	if err := multiplexer.Start(lifecycle); err != nil {
+		cancelLifecycle()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		cancelLifecycle()
+		for _, account := range store.Accounts() {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			_ = multiplexer.stopChild(ctx, account.ID)
+			cancel()
+		}
+	})
+	multiplexer.initialize(protocol.Message{
+		ID: json.RawMessage(`1`), Params: json.RawMessage(`{"clientInfo":{"name":"test","version":"1"}}`),
+	})
+	multiplexer.handleClientNotification(protocol.Message{Method: "initialized"})
+	originalSecondary, ok := multiplexer.child(secondary.ID)
+	if !ok {
+		t.Fatal("secondary was not initialized")
+	}
+	output.Reset()
+	multiplexer.broadcastGlobalMutation(protocol.Message{
+		ID:     json.RawMessage(`2`),
+		Method: "skills/extraRoots/set",
+		Params: json.RawMessage(`{"extraRoots":["/shared"]}`),
+	})
+	response, err := protocol.Parse(bytes.TrimSpace(output.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Error != nil {
+		t.Fatalf("recovered global mutation returned failure: %#v", response.Error)
+	}
+	replacement, ok := multiplexer.child(secondary.ID)
+	if !ok || replacement == originalSecondary {
+		t.Fatal("failed Secondary was not replaced from the journal")
+	}
+	contents, err := os.ReadFile(eventLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	primary, _ := store.Account("primary")
+	mutationHomes := make([]string, 0, 3)
+	for _, line := range strings.Split(strings.TrimSpace(string(contents)), "\n") {
+		fields := strings.SplitN(line, "\t", 2)
+		if len(fields) == 2 && fields[1] == "skills/extraRoots/set" {
+			mutationHomes = append(mutationHomes, fields[0])
+		}
+	}
+	if len(mutationHomes) != 3 || mutationHomes[0] != primary.CodexHome ||
+		mutationHomes[1] != secondary.CodexHome || mutationHomes[2] != secondary.CodexHome {
+		t.Fatalf("unexpected Controller/Secondary mutation order: %#v\n%s", mutationHomes, contents)
+	}
+}
 
 func TestIsUsageLimitResponseRecognizesStructuredError(t *testing.T) {
 	message := protocol.Message{Error: &protocol.RPCError{
@@ -84,10 +261,11 @@ func TestModelRequirementUsesCurrentTurnAndCollaborationOverrides(t *testing.T) 
 
 func TestModelRequirementReadsConfigOverridesWithExplicitFieldsWinning(t *testing.T) {
 	configOnly := modelRequirementFromParams(json.RawMessage(`{
-		"config":{"model":"daybreak-blue","model_reasoning_effort":"xhigh"}
+		"config":{"model":"daybreak-blue","model_reasoning_effort":"xhigh","service_tier":"priority"}
 	}`))
 	if configOnly.Model != "daybreak-blue" || configOnly.Effort != "xhigh" ||
-		!configOnly.ModelKnown || !configOnly.EffortKnown {
+		configOnly.ServiceTier != "priority" || !configOnly.ModelKnown ||
+		!configOnly.EffortKnown || !configOnly.ServiceTierKnown {
 		t.Fatalf("config capability override was ignored: %#v", configOnly)
 	}
 	explicit := modelRequirementFromParams(json.RawMessage(`{
@@ -231,6 +409,29 @@ func TestCrossAccountResumeAndForkCarryEffectiveCapabilityOverrides(t *testing.T
 			t.Fatalf("%s encoded an invalid history field: %s", method, params)
 		}
 	}
+	explicit, err := crossAccountThreadParams("thread/resume", json.RawMessage(`{
+		"threadId":"thread-1","cwd":null,"modelProvider":"custom"
+	}`), info, requirement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(explicit, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if cwd, present := decoded["cwd"]; !present || cwd != nil || decoded["modelProvider"] != "custom" {
+		t.Fatalf("explicit cwd/provider overrides were replaced: %s", explicit)
+	}
+}
+
+func TestMutableObjectParamsHandlesExplicitNull(t *testing.T) {
+	for _, raw := range []json.RawMessage{nil, json.RawMessage(`null`), json.RawMessage(`[]`)} {
+		params := mutableObjectParams(raw)
+		params["limit"] = 500
+		if params["limit"] != 500 {
+			t.Fatalf("mutable params rejected %s", raw)
+		}
+	}
 }
 
 func TestThreadSortingHonorsRequestedKeyDirectionAndSectionOrder(t *testing.T) {
@@ -342,6 +543,16 @@ func TestModelCapabilityChecksReasoningAndServiceTier(t *testing.T) {
 	}
 }
 
+func TestUnavailableCatalogRemainsUnknown(t *testing.T) {
+	multiplexer := &Multiplexer{children: make(map[string]*backend.Child)}
+	states := multiplexer.modelCapabilityStates(context.Background(), []AccountSnapshot{{
+		ID: "secondary", Enabled: true, Connected: true, AuthType: "chatgpt",
+	}}, modelRequirement{Model: "daybreak-blue", ModelKnown: true})
+	if states["secondary"] != modelCapabilityUnknown {
+		t.Fatalf("unavailable catalog was treated as a definitive result: %#v", states)
+	}
+}
+
 func TestMergedModelCatalogKeepsOneRealCapabilityTuple(t *testing.T) {
 	first := map[string]any{
 		"model":                     "model-x",
@@ -410,9 +621,9 @@ func TestEffectiveSettingsAndModelRerouteNotificationsUpdateOwnerState(t *testin
 	if capability = store.ThreadCapability("thread-1"); capability.Model != "safety-model" {
 		t.Fatalf("non-owner notification corrupted capability state: %#v", capability)
 	}
-	if !multiplexer.shouldForwardNotification("secondary", "model/rerouted") ||
-		!multiplexer.shouldForwardNotification("secondary", "model/verification") ||
-		!multiplexer.shouldForwardNotification("secondary", "model/safetyBuffering/updated") {
+	if !multiplexer.shouldForwardNotification("secondary", protocol.Message{Method: "model/rerouted"}) ||
+		!multiplexer.shouldForwardNotification("secondary", protocol.Message{Method: "model/verification"}) ||
+		!multiplexer.shouldForwardNotification("secondary", protocol.Message{Method: "model/safetyBuffering/updated"}) {
 		t.Fatal("secondary model notifications were not forwarded")
 	}
 }
@@ -478,6 +689,128 @@ func TestServerRequestRouteLivesUntilResponseOrChildExit(t *testing.T) {
 	multiplexer.dropServerRoutes("secondary")
 	if len(multiplexer.serverRoutes) != 0 {
 		t.Fatalf("child-exit cleanup retained server routes: %#v", multiplexer.serverRoutes)
+	}
+}
+
+func TestServerRequestResolvedUsesForwardedID(t *testing.T) {
+	output := &bytes.Buffer{}
+	multiplexer := &Multiplexer{
+		output:       output,
+		serverRoutes: make(map[string]serverRequestRoute),
+	}
+	multiplexer.forwardServerRequest(backend.Inbound{
+		AccountID: "secondary",
+		Message: protocol.Request(
+			"item/commandExecution/requestApproval",
+			json.RawMessage(`17`),
+			json.RawMessage(`{"threadId":"thread-1"}`),
+		),
+	})
+	var forwarded json.RawMessage
+	for _, route := range multiplexer.serverRoutes {
+		forwarded = route.forwarded
+	}
+	encoded, ok := multiplexer.rewriteServerRequestResolved("secondary", protocol.Message{
+		Method: "serverRequest/resolved",
+		Params: json.RawMessage(`{"threadId":"thread-1","requestId":17}`),
+	})
+	if !ok {
+		t.Fatal("serverRequest/resolved was not rewritten")
+	}
+	message, err := protocol.Parse(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var params map[string]json.RawMessage
+	if err := json.Unmarshal(message.Params, &params); err != nil {
+		t.Fatal(err)
+	}
+	if protocol.RequestIDKey(params["requestId"]) != protocol.RequestIDKey(forwarded) {
+		t.Fatalf("resolved request ID was not translated: got=%s want=%s", params["requestId"], forwarded)
+	}
+	if len(multiplexer.serverRoutes) != 0 {
+		t.Fatalf("resolved route was retained: %#v", multiplexer.serverRoutes)
+	}
+}
+
+func TestSecondaryThreadScopedNotificationsUseOwner(t *testing.T) {
+	root := t.TempDir()
+	store, err := state.Open(filepath.Join(root, "mux"), filepath.Join(root, "primary"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondary, err := store.AddAccount("Secondary")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetThreadOwner("thread-1", secondary.ID); err != nil {
+		t.Fatal(err)
+	}
+	multiplexer := &Multiplexer{store: store}
+	message := protocol.Message{Method: "warning", Params: json.RawMessage(`{"threadId":"thread-1"}`)}
+	if !multiplexer.shouldForwardNotification(secondary.ID, message) {
+		t.Fatal("owner warning notification was dropped")
+	}
+	if multiplexer.shouldForwardNotification("stale-account", message) {
+		t.Fatal("non-owner warning notification was forwarded")
+	}
+}
+
+func TestInternalThreadStartedSuppressionIsSingleUse(t *testing.T) {
+	multiplexer := &Multiplexer{internalResumes: make(map[string][]*internalResumeSuppression)}
+	suppression := multiplexer.registerInternalResume("secondary", "thread-1")
+	if !multiplexer.suppressInternalResumeNotification("secondary", "thread-1", "thread/tokenUsage/updated") ||
+		!multiplexer.suppressInternalResumeNotification("secondary", "thread-1", "thread/started") {
+		t.Fatal("internal thread/started notification was not consumed")
+	}
+	multiplexer.finishInternalResume(suppression)
+	if multiplexer.suppressInternalResumeNotification("secondary", "thread-1", "thread/started") {
+		t.Fatal("one suppression consumed more than one notification")
+	}
+}
+
+func TestThreadListRouterCursorPreservesPageSize(t *testing.T) {
+	output := &bytes.Buffer{}
+	now := time.Date(2026, time.August, 17, 12, 0, 0, 0, time.UTC)
+	multiplexer := &Multiplexer{
+		output:            output,
+		now:               func() time.Time { return now },
+		threadListCursors: make(map[string]threadListCursorState),
+	}
+	threads := []map[string]any{{"id": "A"}, {"id": "B"}, {"id": "C"}}
+	multiplexer.writeThreadListPage(protocol.Message{
+		ID: json.RawMessage(`1`), Params: json.RawMessage(`{"limit":2}`),
+	}, threadListCursorState{threads: threads, pageSize: 2})
+	first, err := protocol.Parse(bytes.TrimSpace(output.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var firstResult struct {
+		Data       []map[string]any `json:"data"`
+		NextCursor *string          `json:"nextCursor"`
+	}
+	if err := json.Unmarshal(first.Result, &firstResult); err != nil {
+		t.Fatal(err)
+	}
+	if len(firstResult.Data) != 2 || firstResult.NextCursor == nil {
+		t.Fatalf("first page ignored limit/cursor: %s", first.Result)
+	}
+	output.Reset()
+	cursorParams, _ := json.Marshal(map[string]any{"cursor": *firstResult.NextCursor})
+	multiplexer.aggregateThreadList(protocol.Message{ID: json.RawMessage(`2`), Params: cursorParams})
+	second, err := protocol.Parse(bytes.TrimSpace(output.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var secondResult struct {
+		Data       []map[string]any `json:"data"`
+		NextCursor *string          `json:"nextCursor"`
+	}
+	if err := json.Unmarshal(second.Result, &secondResult); err != nil {
+		t.Fatal(err)
+	}
+	if len(secondResult.Data) != 1 || anyString(secondResult.Data[0]["id"]) != "C" || secondResult.NextCursor != nil {
+		t.Fatalf("second page was not resumed from Router cursor: %s", second.Result)
 	}
 }
 

@@ -61,11 +61,17 @@ func (m *Multiplexer) migrateThreadCapabilityOverride(
 	source AccountSnapshot,
 	requested modelRequirement,
 ) {
-	info, err := m.readThreadResumeInfo(ctx, threadID, sourceAccountID)
+	info, err := m.readThreadResumeInfo(ctx, threadID, sourceAccountID, message.Method == "thread/fork")
 	if err != nil {
 		m.write(protocol.Failure(message.ID, -32027, fmt.Sprintf("recover chat settings before capability routing: %v", err)))
 		return
 	}
+	cleanupInternalSource := message.Method == "thread/fork" && info.LoadedKnown && !info.WasLoaded
+	defer func() {
+		if cleanupInternalSource {
+			go m.unsubscribeThreadOnAccount(sourceAccountID, threadID)
+		}
+	}()
 	if !historyModeSupportsCrossProcessFailover(info.HistoryMode) {
 		m.write(protocol.Failure(message.ID, -32027,
 			"the chat history mode cannot be opened safely by a different app-server process"))
@@ -74,6 +80,20 @@ func (m *Multiplexer) migrateThreadCapabilityOverride(
 	requirement := info.Capability.overlay(requested)
 	if requirement.Model == "" {
 		m.write(protocol.Failure(message.ID, -32031, errUnknownThreadModelCapability.Error()))
+		return
+	}
+	if sourceStillSupports, supportErr := m.accountSupportsRequirement(ctx, source, requirement); supportErr != nil || sourceStillSupports {
+		// The source resume refreshed stale effective settings. UNKNOWN remains
+		// non-destructive, and a now-compatible owner should handle the request.
+		if cleanupInternalSource {
+			if err := m.forwardWithCleanup(sourceAccountID, message, sourceAccountID, threadID); err != nil {
+				m.write(protocol.Failure(message.ID, -32023, err.Error()))
+			} else {
+				cleanupInternalSource = false
+			}
+		} else {
+			m.forwardThreadOverrideToOwner(message, sourceAccountID)
+		}
 		return
 	}
 	excluded := map[string]struct{}{sourceAccountID: {}}
@@ -117,6 +137,7 @@ func (m *Multiplexer) migrateThreadCapabilityOverride(
 			}
 			return
 		}
+		go m.unsubscribeThreadOnAccount(sourceAccountID, threadID)
 	} else {
 		if targetInfo.ID == "" || targetInfo.ID == threadID {
 			m.write(protocol.Failure(message.ID, -32028, "target fork did not return a new thread identity"))
@@ -129,6 +150,14 @@ func (m *Multiplexer) migrateThreadCapabilityOverride(
 		if err := m.store.UpdateThreadCapability(targetInfo.ID, stateCapabilityUpdate(targetInfo.Capability)); err != nil {
 			m.write(protocol.Failure(message.ID, -32028, fmt.Sprintf("persist fork settings: %v", err)))
 			return
+		}
+		if err := m.store.CopyControllerAffinity(threadID, targetInfo.ID); err != nil {
+			m.write(protocol.Failure(message.ID, -32028, fmt.Sprintf("persist fork Controller affinity: %v", err)))
+			return
+		}
+		if info.LoadedKnown && !info.WasLoaded {
+			go m.unsubscribeThreadOnAccount(sourceAccountID, threadID)
+			cleanupInternalSource = false
 		}
 	}
 
@@ -188,10 +217,10 @@ func crossAccountThreadParams(
 	if method == "thread/resume" {
 		params["history"] = nil
 	}
-	if info.CWD != "" {
+	if _, explicitlySet := params["cwd"]; !explicitlySet && info.CWD != "" {
 		params["cwd"] = info.CWD
 	}
-	if info.ModelProvider != "" {
+	if _, explicitlySet := params["modelProvider"]; !explicitlySet && info.ModelProvider != "" {
 		params["modelProvider"] = info.ModelProvider
 	}
 	config, _ := params["config"].(map[string]any)

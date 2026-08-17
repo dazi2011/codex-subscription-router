@@ -33,22 +33,33 @@ type Options struct {
 }
 
 type externalRoute struct {
-	sequence  uint64
-	accountID string
-	method    string
-	message   protocol.Message
+	sequence             uint64
+	accountID            string
+	method               string
+	message              protocol.Message
+	unsubscribeAccountID string
+	unsubscribeThreadID  string
 }
 
 type serverRequestRoute struct {
 	accountID string
 	original  json.RawMessage
+	forwarded json.RawMessage
+	responded bool
 }
 
 type childInitializeResult struct {
 	accountID  string
 	controller bool
+	child      *backend.Child
 	response   protocol.Message
 	err        error
+}
+
+type internalResumeSuppression struct {
+	key         string
+	started     chan struct{}
+	startedSeen bool
 }
 
 type Event struct {
@@ -81,12 +92,14 @@ type Multiplexer struct {
 	globalMutations  map[string]globalMutation
 	globalOrder      []string
 
-	externalMu     sync.Mutex
-	externalRoutes map[string]externalRoute
-	routeSequence  atomic.Uint64
-	serverMu       sync.Mutex
-	serverRoutes   map[string]serverRequestRoute
-	serverSequence atomic.Uint64
+	externalMu       sync.Mutex
+	externalRoutes   map[string]externalRoute
+	routeSequence    atomic.Uint64
+	serverMu         sync.Mutex
+	serverRoutes     map[string]serverRequestRoute
+	serverSequence   atomic.Uint64
+	internalResumeMu sync.Mutex
+	internalResumes  map[string][]*internalResumeSuppression
 
 	outputMu sync.Mutex
 	eventsMu sync.RWMutex
@@ -107,7 +120,10 @@ type Multiplexer struct {
 	resetPreviewMu sync.RWMutex
 	resetPreviews  map[string]ResetCreditsPreview
 
-	threadLocks [64]sync.Mutex
+	threadLocks        [64]sync.Mutex
+	threadListCursorMu sync.Mutex
+	threadListCursors  map[string]threadListCursorState
+	threadListSequence atomic.Uint64
 }
 
 func New(options Options) (*Multiplexer, error) {
@@ -124,6 +140,7 @@ func New(options Options) (*Multiplexer, error) {
 		inbound:              make(chan backend.Inbound, 1024),
 		externalRoutes:       make(map[string]externalRoute),
 		serverRoutes:         make(map[string]serverRequestRoute),
+		internalResumes:      make(map[string][]*internalResumeSuppression),
 		globalMutations:      make(map[string]globalMutation),
 		events:               make(map[chan Event]struct{}),
 		profileClient:        &http.Client{Timeout: 10 * time.Second},
@@ -132,6 +149,7 @@ func New(options Options) (*Multiplexer, error) {
 		resetCreditsCache:    make(map[string]resetCreditsCacheEntry),
 		resetCreditsEndpoint: rateLimitResetCreditsURL,
 		resetPreviews:        make(map[string]ResetCreditsPreview),
+		threadListCursors:    make(map[string]threadListCursorState),
 	}, nil
 }
 
@@ -216,6 +234,10 @@ func (m *Multiplexer) initialize(message protocol.Message) {
 	m.initializationMu.Unlock()
 
 	entries := m.childEntries()
+	controllerID := ""
+	if controller, ok := m.store.Controller(); ok {
+		controllerID = controller.ID
+	}
 	results := make(chan childInitializeResult, len(entries))
 	ctx, cancel := context.WithTimeout(context.Background(), controlRequestTimeout)
 	defer cancel()
@@ -223,7 +245,8 @@ func (m *Multiplexer) initialize(message protocol.Message) {
 		go func(entry childEntry) {
 			response, err := entry.child.Request(ctx, "initialize", message.Params)
 			results <- childInitializeResult{
-				accountID: entry.account.ID, controller: entry.account.Controller,
+				accountID: entry.account.ID, controller: entry.account.ID == controllerID,
+				child:    entry.child,
 				response: response, err: err,
 			}
 		}(entry)
@@ -243,13 +266,22 @@ func (m *Multiplexer) initialize(message protocol.Message) {
 			Message: "Some secondary app-servers failed to initialize",
 			Data:    map[string]any{"failedAccountIds": failedSecondaries},
 		})
+		failed := make(map[string]struct{}, len(failedSecondaries))
 		for _, accountID := range failedSecondaries {
-			go func(accountID string) {
-				stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer stopCancel()
-				_ = m.stopChild(stopCtx, accountID)
-			}(accountID)
+			failed[accountID] = struct{}{}
 		}
+		var cleanup sync.WaitGroup
+		for _, result := range completed {
+			if _, shouldDiscard := failed[result.accountID]; !shouldDiscard || result.child == nil {
+				continue
+			}
+			cleanup.Add(1)
+			go func(result childInitializeResult) {
+				defer cleanup.Done()
+				m.discardUnreadyChild(result.accountID, result.child)
+			}(result)
+		}
+		cleanup.Wait()
 	}
 	m.write(protocol.Success(message.ID, controllerResult))
 }
@@ -363,6 +395,14 @@ func (m *Multiplexer) routeExistingRequest(message protocol.Message) {
 }
 
 func (m *Multiplexer) forward(accountID string, message protocol.Message) error {
+	return m.forwardWithCleanup(accountID, message, "", "")
+}
+
+func (m *Multiplexer) forwardWithCleanup(
+	accountID string,
+	message protocol.Message,
+	unsubscribeAccountID, unsubscribeThreadID string,
+) error {
 	child, err := m.ensureChild(context.Background(), accountID)
 	if err != nil {
 		return err
@@ -371,10 +411,8 @@ func (m *Multiplexer) forward(accountID string, message protocol.Message) error 
 	sequence := m.routeSequence.Add(1)
 	m.externalMu.Lock()
 	m.externalRoutes[key] = externalRoute{
-		sequence:  sequence,
-		accountID: accountID,
-		method:    message.Method,
-		message:   message,
+		sequence: sequence, accountID: accountID, method: message.Method, message: message,
+		unsubscribeAccountID: unsubscribeAccountID, unsubscribeThreadID: unsubscribeThreadID,
 	}
 	m.externalMu.Unlock()
 	if err := child.Send(message); err != nil {
@@ -462,7 +500,7 @@ func (m *Multiplexer) failoverTurn(
 		m.write(protocol.Failure(message.ID, -32031, "cannot establish the source account data boundary for safe failover"))
 		return
 	}
-	resume, err := m.readThreadResumeInfo(ctx, threadID, sourceAccountID)
+	resume, err := m.readThreadResumeInfo(ctx, threadID, sourceAccountID, false)
 	if err != nil {
 		m.write(protocol.Failure(message.ID, -32027, fmt.Sprintf("recover chat settings before failover: %v", err)))
 		return
@@ -533,6 +571,7 @@ func (m *Multiplexer) failoverTurn(
 		}
 		return
 	}
+	go m.unsubscribeThreadOnAccount(sourceAccountID, threadID)
 	m.publish(Event{
 		Type:      "thread-failed-over",
 		AccountID: fallback.ID,
@@ -552,6 +591,8 @@ type threadResumeInfo struct {
 	ModelProvider string
 	HistoryMode   string
 	Capability    modelRequirement
+	WasLoaded     bool
+	LoadedKnown   bool
 }
 
 func threadResumeInfoFromResponse(result json.RawMessage) (threadResumeInfo, error) {
@@ -625,13 +666,23 @@ func stateCapabilityUpdate(requirement modelRequirement) state.ThreadCapabilityU
 	return update
 }
 
-func (m *Multiplexer) readThreadResumeInfo(ctx context.Context, threadID, sourceAccountID string) (threadResumeInfo, error) {
+func (m *Multiplexer) readThreadResumeInfo(
+	ctx context.Context,
+	threadID, sourceAccountID string,
+	trackPriorLoadedState bool,
+) (threadResumeInfo, error) {
 	source, err := m.ensureChild(ctx, sourceAccountID)
 	if err != nil {
 		return threadResumeInfo{}, fmt.Errorf("source subscription is unavailable: %w", err)
 	}
+	wasLoaded, loadedKnown := false, false
+	if trackPriorLoadedState {
+		wasLoaded, loadedKnown = m.threadLoadedOnAccount(ctx, sourceAccountID, source, threadID)
+	}
 	resumeParams, _ := json.Marshal(map[string]any{"threadId": threadID})
+	suppression := m.registerInternalResume(sourceAccountID, threadID)
 	resumeResponse, err := source.Request(ctx, "thread/resume", resumeParams)
+	m.finishInternalResume(suppression)
 	if err != nil {
 		return threadResumeInfo{}, fmt.Errorf("resume existing chat on source subscription: %w", err)
 	}
@@ -639,6 +690,8 @@ func (m *Multiplexer) readThreadResumeInfo(ctx context.Context, threadID, source
 	if err != nil {
 		return threadResumeInfo{}, fmt.Errorf("decode source chat settings: %w", err)
 	}
+	info.WasLoaded = wasLoaded
+	info.LoadedKnown = loadedKnown
 	if info.ID == "" {
 		return threadResumeInfo{}, errors.New("existing chat has no thread ID")
 	}
@@ -650,6 +703,36 @@ func (m *Multiplexer) readThreadResumeInfo(ctx context.Context, threadID, source
 	}
 	_ = m.store.UpdateThreadCapability(threadID, stateCapabilityUpdate(info.Capability))
 	return info, nil
+}
+
+func (m *Multiplexer) threadLoadedOnAccount(
+	ctx context.Context,
+	accountID string,
+	child *backend.Child,
+	threadID string,
+) (bool, bool) {
+	account, _ := m.store.Account(accountID)
+	threadIDs, err := listAllLoadedThreads(ctx, childEntry{account: account, child: child}, json.RawMessage(`{}`))
+	if err != nil {
+		return false, false
+	}
+	for _, candidate := range threadIDs {
+		if candidate == threadID {
+			return true, true
+		}
+	}
+	return false, true
+}
+
+func (m *Multiplexer) unsubscribeThreadOnAccount(accountID, threadID string) {
+	child, ok := m.child(accountID)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), controlRequestTimeout)
+	defer cancel()
+	params, _ := json.Marshal(map[string]any{"threadId": threadID})
+	_, _ = child.Request(ctx, "thread/unsubscribe", params)
 }
 
 func (m *Multiplexer) resumeThreadOnAccount(
@@ -691,8 +774,11 @@ func (m *Multiplexer) handleServerRequestResponse(message protocol.Message) {
 	key := protocol.RequestIDKey(message.ID)
 	m.serverMu.Lock()
 	route, ok := m.serverRoutes[key]
-	if ok {
-		delete(m.serverRoutes, key)
+	if ok && !route.responded {
+		route.responded = true
+		m.serverRoutes[key] = route
+	} else if ok {
+		ok = false
 	}
 	m.serverMu.Unlock()
 	if !ok {
@@ -700,8 +786,13 @@ func (m *Multiplexer) handleServerRequestResponse(message protocol.Message) {
 	}
 	message.ID = route.original
 	if child, exists := m.child(route.accountID); exists {
-		_ = child.Send(message)
+		if child.Send(message) == nil {
+			return
+		}
 	}
+	m.serverMu.Lock()
+	delete(m.serverRoutes, key)
+	m.serverMu.Unlock()
 }
 
 func (m *Multiplexer) inboundLoop(ctx context.Context) {
@@ -726,6 +817,9 @@ func (m *Multiplexer) handleInbound(inbound backend.Inbound) {
 		}
 		m.externalMu.Unlock()
 		if ok {
+			if route.unsubscribeAccountID != "" && route.unsubscribeThreadID != "" {
+				go m.unsubscribeThreadOnAccount(route.unsubscribeAccountID, route.unsubscribeThreadID)
+			}
 			if route.method == "turn/start" && isUsageLimitResponse(message) {
 				go m.publishAccountRefresh(inbound.AccountID)
 				m.publish(Event{
@@ -745,6 +839,15 @@ func (m *Multiplexer) handleInbound(inbound backend.Inbound) {
 		m.forwardServerRequest(inbound)
 		return
 	}
+	notificationThreadID := threadIDFromParams(message.Params)
+	if notificationThreadID == "" {
+		notificationThreadID = threadIDFromNotification(message.Params)
+	}
+	if notificationThreadID != "" && m.suppressInternalResumeNotification(
+		inbound.AccountID, notificationThreadID, message.Method,
+	) {
+		return
+	}
 	if message.Method == "account/rateLimits/updated" {
 		go m.forwardAggregatedRateLimitNotification(inbound.Raw)
 		return
@@ -760,12 +863,18 @@ func (m *Multiplexer) handleInbound(inbound backend.Inbound) {
 	if message.Method == "model/rerouted" {
 		m.learnModelReroute(inbound.AccountID, message.Params)
 	}
+	if message.Method == "serverRequest/resolved" {
+		if rewritten, ok := m.rewriteServerRequestResolved(inbound.AccountID, message); ok {
+			m.writeRaw(rewritten)
+			return
+		}
+	}
 	if message.Method == "turn/completed" ||
 		message.Method == "account/login/completed" ||
 		message.Method == "account/updated" {
 		go m.publishAccountRefresh(inbound.AccountID)
 	}
-	if m.shouldForwardNotification(inbound.AccountID, message.Method) {
+	if m.shouldForwardNotification(inbound.AccountID, message) {
 		m.writeRaw(inbound.Raw)
 	}
 }
@@ -794,16 +903,57 @@ func (m *Multiplexer) forwardServerRequest(inbound backend.Inbound) {
 	m.serverRoutes[key] = serverRequestRoute{
 		accountID: inbound.AccountID,
 		original:  append(json.RawMessage(nil), inbound.Message.ID...),
+		forwarded: append(json.RawMessage(nil), newID...),
 	}
 	m.serverMu.Unlock()
 	inbound.Message.ID = newID
 	m.write(inbound.Message)
 }
 
-func (m *Multiplexer) shouldForwardNotification(accountID, method string) bool {
+func (m *Multiplexer) rewriteServerRequestResolved(accountID string, message protocol.Message) ([]byte, bool) {
+	var params map[string]json.RawMessage
+	if json.Unmarshal(message.Params, &params) != nil || params == nil {
+		return nil, false
+	}
+	originalID := params["requestId"]
+	if len(originalID) == 0 {
+		return nil, false
+	}
+	originalKey := protocol.RequestIDKey(originalID)
+	var forwarded json.RawMessage
+	m.serverMu.Lock()
+	for key, route := range m.serverRoutes {
+		if route.accountID == accountID && protocol.RequestIDKey(route.original) == originalKey {
+			forwarded = append(json.RawMessage(nil), route.forwarded...)
+			delete(m.serverRoutes, key)
+			break
+		}
+	}
+	m.serverMu.Unlock()
+	if len(forwarded) == 0 {
+		return nil, false
+	}
+	params["requestId"] = forwarded
+	encodedParams, err := json.Marshal(params)
+	if err != nil {
+		return nil, false
+	}
+	message.Params = encodedParams
+	encoded, err := protocol.Encode(message)
+	if err != nil {
+		return nil, false
+	}
+	return encoded, true
+}
+
+func (m *Multiplexer) shouldForwardNotification(accountID string, message protocol.Message) bool {
 	controller, ok := m.store.Controller()
 	if ok && controller.ID == accountID {
 		return true
+	}
+	method := message.Method
+	if threadID := threadIDFromParams(message.Params); threadID != "" {
+		return m.notificationOwnsThread(threadID, accountID)
 	}
 	return strings.HasPrefix(method, "thread/") ||
 		strings.HasPrefix(method, "turn/") ||
@@ -821,9 +971,17 @@ func (m *Multiplexer) learnThreadOwner(route externalRoute, accountID string, re
 			if info, err := threadResumeInfoFromResponse(result); err == nil {
 				_ = m.store.UpdateThreadCapability(threadID, stateCapabilityUpdate(info.Capability))
 			}
-			if (route.method == "thread/start" && threadStartUsesControllerState(route.message.Params)) ||
-				(route.method == "thread/fork" && m.store.ControllerAffinedThread(threadIDFromParams(route.message.Params))) {
-				_ = m.store.SetControllerAffinedThread(threadID)
+			if route.method == "thread/start" {
+				usesProject, usesSection := threadStartControllerAffinity(route.message.Params)
+				if usesProject {
+					_ = m.store.SetControllerAffinedThread(threadID)
+				}
+				if usesSection {
+					_ = m.store.SetThreadSectionAffinity(threadID, true)
+				}
+			}
+			if route.method == "thread/fork" {
+				_ = m.store.CopyControllerAffinity(threadIDFromParams(route.message.Params), threadID)
 			}
 		}
 	case "thread/unarchive":
@@ -838,8 +996,13 @@ func (m *Multiplexer) learnThreadOwner(route externalRoute, accountID string, re
 		if threadID := threadIDFromParams(route.message.Params); threadID != "" {
 			_ = m.store.SetThreadOwner(threadID, accountID)
 			var params map[string]any
-			if json.Unmarshal(route.message.Params, &params) == nil && params["sectionId"] != nil {
-				_ = m.store.SetControllerAffinedThread(threadID)
+			if json.Unmarshal(route.message.Params, &params) == nil {
+				for _, key := range []string{"sectionId", "section_id"} {
+					if sectionID, present := params[key]; present {
+						_ = m.store.SetThreadSectionAffinity(threadID, sectionID != nil && anyString(sectionID) != "")
+						break
+					}
+				}
 			}
 		}
 	}
@@ -881,6 +1044,69 @@ func (m *Multiplexer) notificationOwnsThread(threadID, accountID string) bool {
 		owner, exists = m.store.ThreadOwner(threadID)
 	}
 	return exists && owner == accountID
+}
+
+func internalResumeKey(accountID, threadID string) string {
+	return accountID + "\x00" + threadID
+}
+
+func (m *Multiplexer) registerInternalResume(accountID, threadID string) *internalResumeSuppression {
+	suppression := &internalResumeSuppression{
+		key:     internalResumeKey(accountID, threadID),
+		started: make(chan struct{}),
+	}
+	m.internalResumeMu.Lock()
+	m.internalResumes[suppression.key] = append(m.internalResumes[suppression.key], suppression)
+	m.internalResumeMu.Unlock()
+	return suppression
+}
+
+func (m *Multiplexer) suppressInternalResumeNotification(accountID, threadID, method string) bool {
+	switch method {
+	case "thread/started", "thread/tokenUsage/updated", "thread/status/changed", "thread/settings/updated":
+	default:
+		return false
+	}
+	key := internalResumeKey(accountID, threadID)
+	m.internalResumeMu.Lock()
+	queue := m.internalResumes[key]
+	if len(queue) == 0 {
+		m.internalResumeMu.Unlock()
+		return false
+	}
+	suppression := queue[0]
+	if method == "thread/started" && !suppression.startedSeen {
+		suppression.startedSeen = true
+		close(suppression.started)
+	}
+	m.internalResumeMu.Unlock()
+	return true
+}
+
+func (m *Multiplexer) finishInternalResume(suppression *internalResumeSuppression) {
+	select {
+	case <-suppression.started:
+		// The response and its bootstrap notifications are adjacent on the
+		// child stream. Keep a short grace period for token/status updates that
+		// can follow thread/started.
+		time.Sleep(50 * time.Millisecond)
+	case <-time.After(500 * time.Millisecond):
+	}
+	m.internalResumeMu.Lock()
+	queue := m.internalResumes[suppression.key]
+	for index, candidate := range queue {
+		if candidate != suppression {
+			continue
+		}
+		queue = append(queue[:index], queue[index+1:]...)
+		if len(queue) == 0 {
+			delete(m.internalResumes, suppression.key)
+		} else {
+			m.internalResumes[suppression.key] = queue
+		}
+		break
+	}
+	m.internalResumeMu.Unlock()
 }
 
 func (m *Multiplexer) write(message protocol.Message) {
@@ -962,9 +1188,6 @@ func (m *Multiplexer) startChild(ctx context.Context, account state.Account) (*b
 	if err != nil {
 		return nil, err
 	}
-	m.childrenMu.Lock()
-	m.children[account.ID] = child
-	m.childrenMu.Unlock()
 
 	m.initializationMu.RLock()
 	params := append(json.RawMessage(nil), m.initializeParams...)
@@ -989,18 +1212,33 @@ func (m *Multiplexer) startChild(ctx context.Context, account state.Account) (*b
 			}
 		}
 	}
+	if child.IsClosed() {
+		m.discardUnreadyChild(account.ID, child)
+		return nil, errors.New("Codex app-server exited before becoming ready")
+	}
+	m.childrenMu.Lock()
+	m.children[account.ID] = child
+	m.childrenMu.Unlock()
 	go m.watchChild(account.ID, child)
 	return child, nil
 }
 
 func (m *Multiplexer) discardUnreadyChild(accountID string, child *backend.Child) {
+	m.discardChild(accountID, child, "Codex app-server failed to initialize")
+}
+
+func (m *Multiplexer) discardChild(accountID string, child *backend.Child, reason string) {
+	removed := false
 	m.childrenMu.Lock()
 	if m.children[accountID] == child {
 		delete(m.children, accountID)
+		removed = true
 	}
 	m.childrenMu.Unlock()
-	m.failExternalRoutes(accountID, "Codex app-server failed to initialize")
-	m.dropServerRoutes(accountID)
+	if removed {
+		m.failExternalRoutes(accountID, reason)
+		m.dropServerRoutes(accountID)
+	}
 	_ = child.Close()
 	select {
 	case <-child.Done():
@@ -1168,6 +1406,14 @@ func threadIDFromParams(params json.RawMessage) string {
 		}
 	}
 	return ""
+}
+
+func mutableObjectParams(params json.RawMessage) map[string]any {
+	var decoded map[string]any
+	if len(params) == 0 || json.Unmarshal(params, &decoded) != nil || decoded == nil {
+		return make(map[string]any)
+	}
+	return decoded
 }
 
 func threadIDFromResult(result json.RawMessage) string {

@@ -5,11 +5,34 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/b-nnett/codex-subscription-router/internal/protocol"
 )
 
+const (
+	defaultThreadListPageSize = 50
+	maxThreadListPageSize     = 500
+	threadListCursorTTL       = 5 * time.Minute
+	maxThreadListCursors      = 16
+)
+
+type threadListCursorState struct {
+	threads   []map[string]any
+	pageSize  int
+	expiresAt time.Time
+}
+
 func (m *Multiplexer) aggregateThreadList(request protocol.Message) {
+	if cursor := threadListCursor(request.Params); cursor != "" {
+		state, ok := m.takeThreadListCursor(cursor)
+		if !ok {
+			m.write(protocol.Failure(request.ID, -32602, "thread/list cursor is invalid or expired"))
+			return
+		}
+		m.writeThreadListPage(request, state)
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), controlRequestTimeout)
 	defer cancel()
 	entries := m.threadListEntries(request.Params)
@@ -68,6 +91,7 @@ func (m *Multiplexer) aggregateThreadList(request protocol.Message) {
 
 	threads := make([]map[string]any, 0, len(order)+len(anonymous))
 	owners := make(map[string]string, len(order))
+	sectionThreadIDs := make([]string, 0)
 	for _, threadID := range order {
 		candidates := byID[threadID]
 		selected := candidates[0]
@@ -82,6 +106,9 @@ func (m *Multiplexer) aggregateThreadList(request protocol.Message) {
 			}
 		}
 		threads = append(threads, selected.thread)
+		if section, present := selected.thread["section"]; present && section != nil {
+			sectionThreadIDs = append(sectionThreadIDs, threadID)
+		}
 		if persistedOwner != "" {
 			owners[threadID] = persistedOwner
 		} else {
@@ -89,17 +116,95 @@ func (m *Multiplexer) aggregateThreadList(request protocol.Message) {
 		}
 	}
 	threads = append(threads, anonymous...)
-	if err := m.store.MergeThreadMetadata(owners, nil); err != nil {
+	if err := m.store.MergeThreadMetadata(owners, nil, sectionThreadIDs); err != nil {
 		m.write(protocol.Failure(request.ID, -32603, fmt.Sprintf("persist merged thread list: %v", err)))
 		return
 	}
 	sortThreads(threads, request.Params)
-	encoded, err := json.Marshal(map[string]any{"data": threads, "nextCursor": nil})
+	m.writeThreadListPage(request, threadListCursorState{
+		threads: threads, pageSize: threadListPageSize(request.Params, defaultThreadListPageSize),
+	})
+}
+
+func threadListCursor(params json.RawMessage) string {
+	var decoded map[string]any
+	if json.Unmarshal(params, &decoded) != nil || decoded == nil {
+		return ""
+	}
+	return anyString(decoded["cursor"])
+}
+
+func threadListPageSize(params json.RawMessage, fallback int) int {
+	var decoded map[string]any
+	if json.Unmarshal(params, &decoded) == nil && decoded != nil {
+		if value, ok := decoded["limit"].(float64); ok && value > 0 {
+			limit := int(value)
+			if limit > maxThreadListPageSize {
+				return maxThreadListPageSize
+			}
+			return limit
+		}
+	}
+	if fallback <= 0 {
+		return defaultThreadListPageSize
+	}
+	return fallback
+}
+
+func (m *Multiplexer) writeThreadListPage(request protocol.Message, state threadListCursorState) {
+	limit := threadListPageSize(request.Params, state.pageSize)
+	if limit > len(state.threads) {
+		limit = len(state.threads)
+	}
+	page := state.threads[:limit]
+	var nextCursor any
+	if limit < len(state.threads) {
+		state.threads = state.threads[limit:]
+		state.pageSize = limit
+		nextCursor = m.storeThreadListCursor(state)
+	}
+	encoded, err := json.Marshal(map[string]any{"data": page, "nextCursor": nextCursor})
 	if err != nil {
 		m.write(protocol.Failure(request.ID, -32603, "failed to merge thread list"))
 		return
 	}
 	m.write(protocol.Success(request.ID, encoded))
+}
+
+func (m *Multiplexer) storeThreadListCursor(state threadListCursorState) string {
+	now := m.now()
+	state.expiresAt = now.Add(threadListCursorTTL)
+	cursor := fmt.Sprintf("codex-mux-thread:%d", m.threadListSequence.Add(1))
+	m.threadListCursorMu.Lock()
+	for key, candidate := range m.threadListCursors {
+		if !candidate.expiresAt.After(now) {
+			delete(m.threadListCursors, key)
+		}
+	}
+	if len(m.threadListCursors) >= maxThreadListCursors {
+		oldestKey := ""
+		var oldest time.Time
+		for key, candidate := range m.threadListCursors {
+			if oldestKey == "" || candidate.expiresAt.Before(oldest) {
+				oldestKey = key
+				oldest = candidate.expiresAt
+			}
+		}
+		delete(m.threadListCursors, oldestKey)
+	}
+	m.threadListCursors[cursor] = state
+	m.threadListCursorMu.Unlock()
+	return cursor
+}
+
+func (m *Multiplexer) takeThreadListCursor(cursor string) (threadListCursorState, bool) {
+	m.threadListCursorMu.Lock()
+	state, ok := m.threadListCursors[cursor]
+	m.threadListCursorMu.Unlock()
+	if !ok || !state.expiresAt.After(m.now()) {
+		return threadListCursorState{}, false
+	}
+	return state, true
 }
 
 func (m *Multiplexer) threadListEntries(params json.RawMessage) []childEntry {
@@ -112,8 +217,12 @@ func (m *Multiplexer) threadListEntries(params json.RawMessage) []childEntry {
 	if !present || sectionID == nil || anyString(sectionID) == "" {
 		return entries
 	}
+	controller, ok := m.store.Controller()
+	if !ok {
+		return nil
+	}
 	for _, entry := range entries {
-		if entry.account.Controller {
+		if entry.account.ID == controller.ID {
 			return []childEntry{entry}
 		}
 	}
@@ -121,10 +230,7 @@ func (m *Multiplexer) threadListEntries(params json.RawMessage) []childEntry {
 }
 
 func (m *Multiplexer) listAllThreads(parent context.Context, entry childEntry, originalParams json.RawMessage) ([]map[string]any, error) {
-	var params map[string]any
-	if json.Unmarshal(originalParams, &params) != nil {
-		params = make(map[string]any)
-	}
+	params := mutableObjectParams(originalParams)
 	params["limit"] = 500
 	threads := make([]map[string]any, 0)
 	seenCursors := make(map[string]struct{})
