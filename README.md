@@ -27,7 +27,10 @@ binaries or a prebuilt application.
 - **Sticky conversations.** Once a thread is assigned, every follow-up returns
   to the same subscription unless that subscription is depleted.
 - **Automatic failover.** A depleted thread continues through another account
-  with quota; if the whole pool is empty, the app shows one combined alert.
+  with quota and the same model capability; if the compatible pool is empty,
+  the app shows an explicit error.
+- **Multi-account model discovery.** The model selector is the de-duplicated
+  union of enabled subscriptions rather than the Primary account's list.
 - **Native account management.** The existing profile menu shows pooled usage,
   profile photos, plan names, masked emails, and device-code sign-in.
 - **Account-aware settings.** Profile statistics can be viewed together or per
@@ -195,6 +198,7 @@ starts another sign-in.
 | New chat | Assigned by quota-at-risk, banked resets, and short-window pressure |
 | Follow-up | Sent to the thread's persisted account owner |
 | Owner depleted | Continued through another account with capacity |
+| Post-submit quota error | Original error returned without replaying side effects |
 | Every account depleted | Combined quota alert with the next known reset |
 | Account disabled | Excluded from routing and pooled usable quota |
 
@@ -264,18 +268,31 @@ npm run check
 npm run release:check
 ```
 
-The Go backend and injected renderer have no runtime third-party dependencies.
-`@electron/asar` is build-only. Deterministic UI preview routes are enabled only
+The injected renderer has no runtime package dependency. The Go backend uses a
+locked TOML parser for safe managed-config merging; `@electron/asar` remains
+build-only. Deterministic UI preview routes are enabled only
 when `CODEX_MUX_UI_TESTS=1` is present at launch and remain token-authenticated.
 
 The signed-app test procedure is in [SMOKE-TEST.md](docs/SMOKE-TEST.md). The
 latest completed run is recorded in
 [E2E-REPORT-0.1.0.md](docs/E2E-REPORT-0.1.0.md).
+The static-review remediation and remaining evidence boundaries are tracked in
+[AUDIT-REMEDIATION.md](docs/AUDIT-REMEDIATION.md).
 
 ## Known limitations
 
 - Upstream ChatGPT updates can require new, reviewed patch anchors.
-- The initial merged history fetch is limited to 500 threads per account.
+- Quota percentages are not normalized into absolute capacity across Plus,
+  Pro, Business, Enterprise, and Edu plans.
+- Workspace/organization identity, account-specific plugin OAuth, MCP OAuth,
+  and project trust are not portable capabilities. Automatic failover should
+  only be used between subscriptions the user considers an equivalent data and
+  tool boundary.
+- The injected renderer is trusted with the control API token; renderer code
+  execution is therefore control API execution, not a separate security
+  boundary.
+- Profile and reset-credit features depend on version-sensitive ChatGPT
+  backend endpoints in addition to stable app-server RPCs.
 - Combined “skills explored” totals can count the same skill once per account
   because the upstream profile response exposes counts rather than skill IDs.
 - Generated app bundles are tied to one macOS user and signing team.

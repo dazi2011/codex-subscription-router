@@ -27,8 +27,19 @@ approvals, and notifications are rewritten only as needed to preserve one
 coherent desktop session.
 
 If the owner is depleted, the multiplexer resumes the rollout on an account
-with capacity and updates ownership. Threads do not migrate for ordinary load
-balancing.
+with capacity that advertises the thread's concrete model. The model selector
+is the de-duplicated union of every enabled child's `model/list`; the same
+capability data constrains new-thread placement and failover. Thread owner and
+model metadata are persisted together. Per-thread locks serialize failover,
+and owner changes use compare-and-swap plus rollback when the target request
+cannot be sent. A quota error received after `turn/start` was submitted is not
+replayed, because the router cannot prove the failed turn had no external side
+effects. Threads do not migrate for ordinary load balancing.
+
+Child exit removes that process from the live map, fails outstanding desktop
+RPCs, and restarts the child while its account remains enabled. Forwarded RPC
+and server-request route entries have bounded lifetimes. Initialization fans
+out concurrently under one timeout.
 
 ## Account isolation
 
@@ -36,6 +47,8 @@ The Primary account uses `~/.codex`. Added accounts use
 `~/.codex-mux/accounts/<id>/codex-home`. Managed configuration is copied from
 the Primary account, excluding credential-store settings and project trust.
 Each isolated account forces file-backed CLI and MCP OAuth credentials.
+Configuration is parsed as TOML, synchronized only when the Primary content
+changes, and not rewritten when the generated secondary content is identical.
 
 ## Desktop integration
 
@@ -60,4 +73,8 @@ The renderer talks to a loopback-only HTTP service on port 48123. All private
 routes require a random 256-bit token. CORS is limited to the copied app's
 `app://-` origin. The service exposes account metadata, aggregated usage and
 profile data, thread ownership, login/logout actions, and an authenticated SSE
-event stream; it never returns OAuth tokens.
+event stream; it never returns OAuth tokens. SSE sends the token in a request
+header, not the URL. A missing build token or occupied control port fails the
+app-server closed instead of silently sending credentials to an unknown
+listener. Runtime token and port overrides are intentionally unsupported
+because renderer and server configuration must stay identical.

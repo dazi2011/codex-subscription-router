@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/b-nnett/codex-subscription-router/internal/state"
@@ -126,8 +127,19 @@ func validatedProfileImageURL(value string) (string, error) {
 		return "", nil
 	}
 	parsed, err := url.Parse(value)
-	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil {
 		return "", errors.New("profile image URL is not HTTPS")
+	}
+	host := strings.ToLower(parsed.Hostname())
+	allowed := host == "lh3.googleusercontent.com"
+	for _, suffix := range []string{"openai.com", "chatgpt.com", "oaiusercontent.com"} {
+		if host == suffix || strings.HasSuffix(host, "."+suffix) {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return "", errors.New("profile image URL host is not trusted")
 	}
 	return parsed.String(), nil
 }

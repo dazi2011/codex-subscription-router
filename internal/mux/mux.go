@@ -30,13 +30,14 @@ type Options struct {
 }
 
 type externalRoute struct {
+	sequence  uint64
 	accountID string
 	method    string
 	message   protocol.Message
-	excluded  map[string]struct{}
 }
 
 type serverRequestRoute struct {
+	sequence  uint64
 	accountID string
 	original  json.RawMessage
 }
@@ -59,7 +60,9 @@ type Multiplexer struct {
 
 	childrenMu sync.RWMutex
 	children   map[string]*backend.Child
+	startMu    sync.Mutex
 	inbound    chan backend.Inbound
+	lifecycle  context.Context
 
 	initializationMu sync.RWMutex
 	initializeParams json.RawMessage
@@ -67,6 +70,7 @@ type Multiplexer struct {
 
 	externalMu     sync.Mutex
 	externalRoutes map[string]externalRoute
+	routeSequence  atomic.Uint64
 	serverMu       sync.Mutex
 	serverRoutes   map[string]serverRequestRoute
 	serverSequence atomic.Uint64
@@ -89,6 +93,8 @@ type Multiplexer struct {
 
 	resetPreviewMu sync.RWMutex
 	resetPreviews  map[string]ResetCreditsPreview
+
+	threadLocks [64]sync.Mutex
 }
 
 func New(options Options) (*Multiplexer, error) {
@@ -116,7 +122,11 @@ func New(options Options) (*Multiplexer, error) {
 }
 
 func (m *Multiplexer) Start(ctx context.Context) error {
+	m.lifecycle = ctx
 	for _, account := range m.store.Accounts() {
+		if !account.Enabled {
+			continue
+		}
 		if _, err := m.startChild(ctx, account); err != nil {
 			fmt.Fprintf(os.Stderr, "codex-mux: start account %s: %v\n", account.ID, err)
 		}
@@ -167,6 +177,8 @@ func (m *Multiplexer) HandleClient(message protocol.Message) {
 	switch message.Method {
 	case "thread/list":
 		go m.aggregateThreadList(message)
+	case "model/list":
+		go m.aggregateModelList(message)
 	case "thread/start":
 		go m.routeNewThread(message)
 	case "account/rateLimits/read":
@@ -181,20 +193,32 @@ func (m *Multiplexer) initialize(message protocol.Message) {
 	m.initializeParams = append(json.RawMessage(nil), message.Params...)
 	m.initializationMu.Unlock()
 
+	type result struct {
+		response protocol.Message
+		err      error
+	}
+	entries := m.childEntries()
+	results := make(chan result, len(entries))
+	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	defer cancel()
+	for _, entry := range entries {
+		go func(entry childEntry) {
+			response, err := entry.child.Request(ctx, "initialize", message.Params)
+			results <- result{response: response, err: err}
+		}(entry)
+	}
 	var firstResult json.RawMessage
 	var firstErr error
-	for _, entry := range m.childEntries() {
-		ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
-		response, err := entry.child.Request(ctx, "initialize", message.Params)
-		cancel()
-		if err != nil {
+	for range entries {
+		result := <-results
+		if result.err != nil {
 			if firstErr == nil {
-				firstErr = err
+				firstErr = result.err
 			}
 			continue
 		}
 		if firstResult == nil {
-			firstResult = response.Result
+			firstResult = result.response.Result
 		}
 	}
 	if firstResult == nil {
@@ -222,7 +246,7 @@ func (m *Multiplexer) handleClientNotification(message protocol.Message) {
 func (m *Multiplexer) routeNewThread(message protocol.Message) {
 	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
 	defer cancel()
-	account, reason, err := m.chooseAccount(ctx)
+	account, reason, err := m.chooseAccountForModel(ctx, modelFromParams(message.Params))
 	if err != nil {
 		if errors.Is(err, errNoSubscriptionCapacity) {
 			m.write(m.allSubscriptionsDepleted(ctx, message.ID))
@@ -277,29 +301,39 @@ func (m *Multiplexer) routeExistingRequest(message protocol.Message) {
 }
 
 func (m *Multiplexer) forward(accountID string, message protocol.Message) error {
-	return m.forwardWithExclusions(accountID, message, nil)
-}
-
-func (m *Multiplexer) forwardWithExclusions(accountID string, message protocol.Message, excluded map[string]struct{}) error {
-	child, ok := m.child(accountID)
-	if !ok {
-		return fmt.Errorf("account %s is unavailable", accountID)
+	child, err := m.ensureChild(context.Background(), accountID)
+	if err != nil {
+		return err
 	}
 	key := protocol.RequestIDKey(message.ID)
+	sequence := m.routeSequence.Add(1)
 	m.externalMu.Lock()
 	m.externalRoutes[key] = externalRoute{
+		sequence:  sequence,
 		accountID: accountID,
 		method:    message.Method,
 		message:   message,
-		excluded:  cloneAccountSet(excluded),
 	}
 	m.externalMu.Unlock()
 	if err := child.Send(message); err != nil {
 		m.externalMu.Lock()
-		delete(m.externalRoutes, key)
+		if m.externalRoutes[key].sequence == sequence {
+			delete(m.externalRoutes, key)
+		}
 		m.externalMu.Unlock()
 		return err
 	}
+	time.AfterFunc(requestTimeout, func() {
+		m.externalMu.Lock()
+		route, exists := m.externalRoutes[key]
+		if exists && route.sequence == sequence {
+			delete(m.externalRoutes, key)
+		}
+		m.externalMu.Unlock()
+		if exists && route.sequence == sequence {
+			m.write(protocol.Failure(message.ID, -32030, fmt.Sprintf("%s request timed out", message.Method)))
+		}
+	})
 	return nil
 }
 
@@ -320,10 +354,19 @@ func (m *Multiplexer) routeAggregatedRateLimits(message protocol.Message) {
 }
 
 func (m *Multiplexer) routeTurnStart(message protocol.Message, threadID, ownerID string) {
+	lock := m.threadLock(threadID)
+	lock.Lock()
+	defer lock.Unlock()
+	if currentOwner, ok := m.store.ThreadOwner(threadID); ok {
+		ownerID = currentOwner
+	} else if err := m.store.SetThreadOwner(threadID, ownerID); err != nil {
+		m.write(protocol.Failure(message.ID, -32028, err.Error()))
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*requestTimeout)
 	defer cancel()
 	snapshot, err := m.accountSnapshotWithProfile(ctx, ownerID, false)
-	if err != nil || accountHasCapacity(snapshot) {
+	if err == nil && accountHasCapacity(snapshot) {
 		if err := m.forward(ownerID, message); err != nil {
 			m.write(protocol.Failure(message.ID, -32023, err.Error()))
 		}
@@ -340,21 +383,47 @@ func (m *Multiplexer) failoverTurn(
 	sourceAccountID string,
 	excluded map[string]struct{},
 ) {
-	fallback, _, err := m.chooseAccountExcluding(ctx, excluded)
+	resume, err := m.readThreadResumeInfo(ctx, threadID, sourceAccountID)
 	if err != nil {
-		m.write(m.allSubscriptionsDepleted(ctx, message.ID))
+		m.write(protocol.Failure(message.ID, -32027, fmt.Sprintf("read chat before failover: %v", err)))
 		return
 	}
-	if err := m.resumeThreadOnAccount(ctx, threadID, sourceAccountID, fallback.ID); err != nil {
+	requiredModel, _ := m.store.ThreadModel(threadID)
+	if resume.Model != "" {
+		requiredModel = resume.Model
+	} else if requiredModel == "" {
+		requiredModel = modelFromParams(message.Params)
+	}
+	if requiredModel != "" {
+		resume.Model = requiredModel
+		if err := m.store.SetThreadModel(threadID, requiredModel); err != nil {
+			m.write(protocol.Failure(message.ID, -32028, err.Error()))
+			return
+		}
+	}
+	fallback, _, err := m.chooseAccountForModelExcluding(ctx, excluded, requiredModel)
+	if err != nil {
+		if errors.Is(err, errNoModelCapableSubscription) {
+			m.write(protocol.Failure(message.ID, -32031, err.Error()))
+		} else {
+			m.write(m.allSubscriptionsDepleted(ctx, message.ID))
+		}
+		return
+	}
+	if err := m.resumeThreadOnAccount(ctx, resume, fallback.ID); err != nil {
 		m.write(protocol.Failure(message.ID, -32027, fmt.Sprintf("move chat to %s: %v", fallback.Label, err)))
 		return
 	}
-	if err := m.store.SetThreadOwner(threadID, fallback.ID); err != nil {
+	if err := m.store.CompareAndSwapThreadOwner(threadID, sourceAccountID, fallback.ID); err != nil {
 		m.write(protocol.Failure(message.ID, -32028, err.Error()))
 		return
 	}
-	if err := m.forwardWithExclusions(fallback.ID, message, excluded); err != nil {
-		m.write(protocol.Failure(message.ID, -32023, err.Error()))
+	if err := m.forward(fallback.ID, message); err != nil {
+		if rollbackErr := m.store.CompareAndSwapThreadOwner(threadID, fallback.ID, sourceAccountID); rollbackErr != nil {
+			m.write(protocol.Failure(message.ID, -32023, fmt.Sprintf("%v; owner rollback failed: %v", err, rollbackErr)))
+		} else {
+			m.write(protocol.Failure(message.ID, -32023, err.Error()))
+		}
 		return
 	}
 	m.publish(Event{
@@ -365,41 +434,57 @@ func (m *Multiplexer) failoverTurn(
 	})
 }
 
-func (m *Multiplexer) resumeThreadOnAccount(ctx context.Context, threadID, sourceAccountID, targetAccountID string) error {
-	source, ok := m.child(sourceAccountID)
-	if !ok {
-		return fmt.Errorf("source subscription is unavailable")
-	}
-	target, ok := m.child(targetAccountID)
-	if !ok {
-		return fmt.Errorf("target subscription is unavailable")
+type threadResumeInfo struct {
+	ID            string
+	Path          string
+	CWD           string
+	Model         string
+	ModelProvider string
+}
+
+func (m *Multiplexer) readThreadResumeInfo(ctx context.Context, threadID, sourceAccountID string) (threadResumeInfo, error) {
+	source, err := m.ensureChild(ctx, sourceAccountID)
+	if err != nil {
+		return threadResumeInfo{}, fmt.Errorf("source subscription is unavailable: %w", err)
 	}
 	readParams, _ := json.Marshal(map[string]any{"threadId": threadID, "includeTurns": true})
 	readResponse, err := source.Request(ctx, "thread/read", readParams)
 	if err != nil {
-		return fmt.Errorf("read existing chat: %w", err)
+		return threadResumeInfo{}, fmt.Errorf("read existing chat: %w", err)
 	}
 	var readResult struct {
 		Thread struct {
 			ID            string `json:"id"`
 			Path          string `json:"path"`
 			CWD           string `json:"cwd"`
+			Model         string `json:"model"`
 			ModelProvider string `json:"modelProvider"`
 		} `json:"thread"`
 	}
 	if err := json.Unmarshal(readResponse.Result, &readResult); err != nil {
-		return fmt.Errorf("decode existing chat: %w", err)
+		return threadResumeInfo{}, fmt.Errorf("decode existing chat: %w", err)
 	}
 	if readResult.Thread.ID == "" || readResult.Thread.Path == "" {
-		return errors.New("existing chat has no resumable history path")
+		return threadResumeInfo{}, errors.New("existing chat has no resumable history path")
+	}
+	return threadResumeInfo{
+		ID: readResult.Thread.ID, Path: readResult.Thread.Path, CWD: readResult.Thread.CWD,
+		Model: readResult.Thread.Model, ModelProvider: readResult.Thread.ModelProvider,
+	}, nil
+}
+
+func (m *Multiplexer) resumeThreadOnAccount(ctx context.Context, info threadResumeInfo, targetAccountID string) error {
+	target, err := m.ensureChild(ctx, targetAccountID)
+	if err != nil {
+		return fmt.Errorf("target subscription is unavailable: %w", err)
 	}
 	resumeParams, _ := json.Marshal(map[string]any{
-		"threadId":      threadID,
+		"threadId":      info.ID,
 		"history":       nil,
-		"path":          readResult.Thread.Path,
-		"cwd":           readResult.Thread.CWD,
-		"model":         nil,
-		"modelProvider": readResult.Thread.ModelProvider,
+		"path":          info.Path,
+		"cwd":           info.CWD,
+		"model":         info.Model,
+		"modelProvider": info.ModelProvider,
 	})
 	if _, err := target.Request(ctx, "thread/resume", resumeParams); err != nil {
 		return fmt.Errorf("resume existing chat: %w", err)
@@ -447,8 +532,12 @@ func (m *Multiplexer) handleInbound(inbound backend.Inbound) {
 		m.externalMu.Unlock()
 		if ok {
 			if route.method == "turn/start" && isUsageLimitResponse(message) {
-				go m.retryTurnAfterUsageLimit(route, inbound.AccountID)
-				return
+				go m.publishAccountRefresh(inbound.AccountID)
+				m.publish(Event{
+					Type:      "turn-depleted",
+					AccountID: inbound.AccountID,
+					Message:   "Subscription depleted after the turn was submitted; the turn was not replayed",
+				})
 			}
 			m.learnThreadOwner(route, inbound.AccountID, message.Result)
 			m.writeRaw(inbound.Raw)
@@ -494,36 +583,32 @@ func (m *Multiplexer) forwardAggregatedRateLimitNotification(fallback []byte) {
 	m.write(protocol.Message{Method: "account/rateLimits/updated", Params: params})
 }
 
-func (m *Multiplexer) retryTurnAfterUsageLimit(route externalRoute, exhaustedAccountID string) {
-	threadID := threadIDFromParams(route.message.Params)
-	if threadID == "" {
-		ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
-		defer cancel()
-		m.write(m.allSubscriptionsDepleted(ctx, route.message.ID))
-		return
-	}
-	excluded := cloneAccountSet(route.excluded)
-	if excluded == nil {
-		excluded = make(map[string]struct{})
-	}
-	excluded[exhaustedAccountID] = struct{}{}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*requestTimeout)
-	defer cancel()
-	m.failoverTurn(ctx, route.message, threadID, exhaustedAccountID, excluded)
-}
-
 func (m *Multiplexer) forwardServerRequest(inbound backend.Inbound) {
 	sequence := m.serverSequence.Add(1)
 	newID := protocol.StringID(fmt.Sprintf("codex-mux:%s:%d", inbound.AccountID, sequence))
 	key := protocol.RequestIDKey(newID)
 	m.serverMu.Lock()
 	m.serverRoutes[key] = serverRequestRoute{
+		sequence:  sequence,
 		accountID: inbound.AccountID,
 		original:  append(json.RawMessage(nil), inbound.Message.ID...),
 	}
 	m.serverMu.Unlock()
 	inbound.Message.ID = newID
 	m.write(inbound.Message)
+	time.AfterFunc(requestTimeout, func() {
+		m.serverMu.Lock()
+		route, exists := m.serverRoutes[key]
+		if exists && route.sequence == sequence {
+			delete(m.serverRoutes, key)
+		}
+		m.serverMu.Unlock()
+		if exists && route.sequence == sequence {
+			if child, ok := m.child(route.accountID); ok {
+				_ = child.Send(protocol.Failure(route.original, -32030, "desktop request timed out"))
+			}
+		}
+	})
 }
 
 func (m *Multiplexer) shouldForwardNotification(accountID, method string) bool {
@@ -543,6 +628,9 @@ func (m *Multiplexer) learnThreadOwner(route externalRoute, accountID string, re
 	case "thread/start", "thread/fork", "thread/resume", "thread/unarchive":
 		if threadID := threadIDFromResult(result); threadID != "" {
 			_ = m.store.SetThreadOwner(threadID, accountID)
+			if model := modelFromParams(route.message.Params); model != "" {
+				_ = m.store.SetThreadModel(threadID, model)
+			}
 		}
 	}
 }
@@ -573,7 +661,10 @@ func (m *Multiplexer) childEntries() []childEntry {
 	defer m.childrenMu.RUnlock()
 	entries := make([]childEntry, 0, len(accounts))
 	for _, account := range accounts {
-		if child := m.children[account.ID]; child != nil {
+		if !account.Enabled {
+			continue
+		}
+		if child := m.children[account.ID]; child != nil && !child.IsClosed() {
 			entries = append(entries, childEntry{account: account, child: child})
 		}
 	}
@@ -582,9 +673,12 @@ func (m *Multiplexer) childEntries() []childEntry {
 
 func (m *Multiplexer) child(accountID string) (*backend.Child, bool) {
 	m.childrenMu.RLock()
-	defer m.childrenMu.RUnlock()
 	child, ok := m.children[accountID]
-	return child, ok
+	m.childrenMu.RUnlock()
+	if !ok || child == nil || child.IsClosed() {
+		return nil, false
+	}
+	return child, true
 }
 
 func (m *Multiplexer) controllerChild() (*backend.Child, bool) {
@@ -596,6 +690,16 @@ func (m *Multiplexer) controllerChild() (*backend.Child, bool) {
 }
 
 func (m *Multiplexer) startChild(ctx context.Context, account state.Account) (*backend.Child, error) {
+	if !account.Enabled {
+		return nil, fmt.Errorf("account %s is disabled", account.ID)
+	}
+	m.startMu.Lock()
+	defer m.startMu.Unlock()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
 	if child, ok := m.child(account.ID); ok {
 		return child, nil
 	}
@@ -623,13 +727,123 @@ func (m *Multiplexer) startChild(ctx context.Context, account state.Account) (*b
 		_, err := child.Request(requestCtx, "initialize", params)
 		cancel()
 		if err != nil {
+			m.childrenMu.Lock()
+			if m.children[account.ID] == child {
+				delete(m.children, account.ID)
+			}
+			m.childrenMu.Unlock()
+			_ = child.Close()
+			select {
+			case <-child.Done():
+			case <-time.After(2 * time.Second):
+				_ = child.Kill()
+				select {
+				case <-child.Done():
+				case <-time.After(2 * time.Second):
+				}
+			}
 			return nil, err
 		}
 		if initialized {
 			_ = child.Send(protocol.Message{Method: "initialized"})
 		}
 	}
+	go m.watchChild(account.ID, child)
 	return child, nil
+}
+
+func (m *Multiplexer) ensureChild(ctx context.Context, accountID string) (*backend.Child, error) {
+	if child, ok := m.child(accountID); ok {
+		return child, nil
+	}
+	account, ok := m.store.Account(accountID)
+	if !ok {
+		return nil, fmt.Errorf("account %s is unavailable", accountID)
+	}
+	if !account.Enabled {
+		return nil, fmt.Errorf("account %s is disabled", accountID)
+	}
+	return m.startChild(ctx, account)
+}
+
+func (m *Multiplexer) stopChild(ctx context.Context, accountID string) error {
+	m.childrenMu.Lock()
+	child := m.children[accountID]
+	delete(m.children, accountID)
+	m.childrenMu.Unlock()
+	if child == nil {
+		return nil
+	}
+	m.failExternalRoutes(accountID, "subscription was stopped")
+	_ = child.Close()
+	grace := time.NewTimer(2 * time.Second)
+	defer grace.Stop()
+	select {
+	case <-child.Done():
+		return nil
+	case <-grace.C:
+		if err := child.Kill(); err != nil {
+			return fmt.Errorf("force-stop account %s: %w", accountID, err)
+		}
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case <-child.Done():
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *Multiplexer) watchChild(accountID string, child *backend.Child) {
+	<-child.Done()
+	removed := false
+	m.childrenMu.Lock()
+	if m.children[accountID] == child {
+		delete(m.children, accountID)
+		removed = true
+	}
+	m.childrenMu.Unlock()
+	if !removed {
+		return
+	}
+	m.failExternalRoutes(accountID, "Codex app-server exited before responding")
+
+	if m.lifecycle == nil {
+		return
+	}
+	select {
+	case <-m.lifecycle.Done():
+		return
+	case <-time.After(time.Second):
+	}
+	account, ok := m.store.Account(accountID)
+	if !ok || !account.Enabled {
+		return
+	}
+	if _, err := m.startChild(m.lifecycle, account); err != nil {
+		fmt.Fprintf(os.Stderr, "codex-mux: restart account %s: %v\n", accountID, err)
+	}
+}
+
+func (m *Multiplexer) failExternalRoutes(accountID, reason string) {
+	type failedRoute struct {
+		id     json.RawMessage
+		method string
+	}
+	failed := make([]failedRoute, 0)
+	m.externalMu.Lock()
+	for key, route := range m.externalRoutes {
+		if route.accountID == accountID {
+			failed = append(failed, failedRoute{id: route.message.ID, method: route.method})
+			delete(m.externalRoutes, key)
+		}
+	}
+	m.externalMu.Unlock()
+	for _, route := range failed {
+		m.write(protocol.Failure(route.id, -32032, fmt.Sprintf("%s: %s", route.method, reason)))
+	}
 }
 
 func (m *Multiplexer) SubscribeEvents() (<-chan Event, func()) {
@@ -704,19 +918,59 @@ func accountHasCapacity(snapshot AccountSnapshot) bool {
 		return false
 	}
 	weekly, _ := longestAndShortestWindow(snapshot.RateLimits)
-	return weekly == nil || weekly.UsedPercent < 100
+	return weekly != nil && weekly.UsedPercent < 100
 }
 
 func isUsageLimitResponse(message protocol.Message) bool {
 	if message.Error == nil {
 		return false
 	}
-	text := strings.ToLower(message.Error.Message + " " + string(message.Error.Data))
-	return strings.Contains(text, "usage_limit") ||
-		strings.Contains(text, "usage limit") ||
-		strings.Contains(text, "rate_limit") ||
-		strings.Contains(text, "rate limit") ||
-		strings.Contains(text, "quota")
+	var structured any
+	if len(message.Error.Data) > 0 && json.Unmarshal(message.Error.Data, &structured) == nil {
+		if containsUsageLimitCode(structured) {
+			return true
+		}
+	}
+	normalized := strings.ToLower(strings.TrimSpace(message.Error.Message))
+	return normalized == "usage_limit_exceeded" || normalized == "usage limit exceeded"
+}
+
+func containsUsageLimitCode(value any) bool {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, child := range typed {
+			normalizedKey := strings.ToLower(key)
+			if normalizedKey == "codexerrorinfo" {
+				if text, ok := child.(string); ok && isUsageLimitCode(text) {
+					return true
+				}
+			}
+			if containsUsageLimitCode(child) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if containsUsageLimitCode(child) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isUsageLimitCode(value string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	return normalized == "usage_limit_exceeded" || normalized == "usage_limit_reached"
+}
+
+func (m *Multiplexer) threadLock(threadID string) *sync.Mutex {
+	var hash uint64 = 1469598103934665603
+	for index := 0; index < len(threadID); index++ {
+		hash ^= uint64(threadID[index])
+		hash *= 1099511628211
+	}
+	return &m.threadLocks[hash%uint64(len(m.threadLocks))]
 }
 
 func (m *Multiplexer) allSubscriptionsDepleted(ctx context.Context, id json.RawMessage) protocol.Message {
@@ -746,17 +1000,6 @@ func allSubscriptionsDepleted(id json.RawMessage, resetsAt *int64) protocol.Mess
 		-32026,
 		message,
 	)
-}
-
-func cloneAccountSet(source map[string]struct{}) map[string]struct{} {
-	if len(source) == 0 {
-		return nil
-	}
-	clone := make(map[string]struct{}, len(source))
-	for accountID := range source {
-		clone[accountID] = struct{}{}
-	}
-	return clone
 }
 
 func sortThreads(threads []map[string]any) {

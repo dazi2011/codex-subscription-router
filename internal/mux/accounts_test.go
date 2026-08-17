@@ -51,13 +51,13 @@ func TestAggregateRateLimitsKeepsPoolAvailable(t *testing.T) {
 	weeklyMinutes := int64(10_080)
 	limits, err := aggregateRateLimits([]AccountSnapshot{
 		{
-			ID: "one", Enabled: true, Connected: true, AuthType: "chatgpt",
+			ID: "one", Enabled: true, Connected: true, AuthType: "chatgpt", PlanType: "plus",
 			RateLimits: &RateLimits{Primary: &RateLimitWindow{
 				UsedPercent: 100, WindowDurationMins: &weeklyMinutes,
 			}},
 		},
 		{
-			ID: "two", Enabled: true, Connected: true, AuthType: "chatgpt",
+			ID: "two", Enabled: true, Connected: true, AuthType: "chatgpt", PlanType: "plus",
 			RateLimits: &RateLimits{Primary: &RateLimitWindow{
 				UsedPercent: 20, WindowDurationMins: &weeklyMinutes,
 			}},
@@ -77,11 +77,11 @@ func TestAggregateRateLimitsKeepsPoolAvailable(t *testing.T) {
 func TestAggregateRateLimitsReportsAllDepleted(t *testing.T) {
 	limits, err := aggregateRateLimits([]AccountSnapshot{
 		{
-			ID: "one", Enabled: true, Connected: true, AuthType: "chatgpt",
+			ID: "one", Enabled: true, Connected: true, AuthType: "chatgpt", PlanType: "plus",
 			RateLimits: &RateLimits{Primary: &RateLimitWindow{UsedPercent: 100}},
 		},
 		{
-			ID: "two", Enabled: true, Connected: true, AuthType: "chatgpt",
+			ID: "two", Enabled: true, Connected: true, AuthType: "chatgpt", PlanType: "plus",
 			RateLimits: &RateLimits{Primary: &RateLimitWindow{UsedPercent: 100}},
 		},
 	})
@@ -90,6 +90,16 @@ func TestAggregateRateLimitsReportsAllDepleted(t *testing.T) {
 	}
 	if limits.RateLimitReachedType != "rate_limit_reached" {
 		t.Fatalf("expected the pool to report depletion, got %#v", limits)
+	}
+}
+
+func TestAggregateRateLimitsRejectsMixedPlanPercentages(t *testing.T) {
+	_, err := aggregateRateLimits([]AccountSnapshot{
+		{ID: "plus", Enabled: true, Connected: true, AuthType: "chatgpt", PlanType: "plus", RateLimits: &RateLimits{}},
+		{ID: "pro", Enabled: true, Connected: true, AuthType: "chatgpt", PlanType: "pro", RateLimits: &RateLimits{}},
+	})
+	if err == nil {
+		t.Fatal("mixed Plus and Pro percentages were presented as one capacity")
 	}
 }
 

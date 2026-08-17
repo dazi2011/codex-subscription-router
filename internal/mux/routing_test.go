@@ -29,6 +29,36 @@ func TestIsUsageLimitResponseIgnoresUnrelatedError(t *testing.T) {
 	}
 }
 
+func TestIsUsageLimitResponseIgnoresToolRateLimitsAndQuotaText(t *testing.T) {
+	for _, message := range []string{
+		"MCP server rate limit exceeded",
+		"GitHub API quota exceeded",
+		"provider rate_limit response",
+	} {
+		response := protocol.Message{Error: &protocol.RPCError{Code: -32000, Message: message}}
+		if isUsageLimitResponse(response) {
+			t.Fatalf("tool error %q was misclassified as subscription depletion", message)
+		}
+	}
+	structuredToolError := protocol.Message{Error: &protocol.RPCError{
+		Code: -32000, Message: "tool failed", Data: json.RawMessage(`{"code":"usage_limit_exceeded","source":"mcp"}`),
+	}}
+	if isUsageLimitResponse(structuredToolError) {
+		t.Fatal("structured MCP usage limit was misclassified as subscription depletion")
+	}
+}
+
+func TestModelHelpersUseConcreteModelIdentifier(t *testing.T) {
+	params := json.RawMessage(`{"model":"daybreak-blue"}`)
+	if got := modelFromParams(params); got != "daybreak-blue" {
+		t.Fatalf("modelFromParams() = %q", got)
+	}
+	models := []map[string]any{{"id": "display-id", "model": "daybreak-blue"}}
+	if !modelsContain(models, "daybreak-blue") || modelsContain(models, "other") {
+		t.Fatalf("unexpected model capability match: %#v", models)
+	}
+}
+
 func TestAllSubscriptionsDepletedUsesActionableMessage(t *testing.T) {
 	message := allSubscriptionsDepleted(json.RawMessage(`7`), nil)
 	if message.Error == nil || message.Error.Code != -32026 {

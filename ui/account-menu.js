@@ -20,7 +20,45 @@ async function codexMuxRequest(path, options = {}) {
   });
   const body = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(body.error || `Request failed (${response.status})`);
-  return body;
+	return body;
+}
+
+function codexMuxSubscribeEvents(onMessage) {
+  const controller = new AbortController();
+  (async () => {
+	while (!controller.signal.aborted) {
+	  try {
+		const response = await fetch(`${CODEX_MUX_API}/events`, {
+		  headers: { "X-Codex-Mux-Token": CODEX_MUX_TOKEN },
+		  signal: controller.signal,
+		});
+		if (!response.ok || !response.body) throw new Error("event stream unavailable");
+		const reader = response.body.getReader();
+		const decoder = new TextDecoder();
+		let buffered = "";
+		while (true) {
+		  const { done, value } = await reader.read();
+		  if (done) break;
+		  buffered += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+		  let boundary;
+		  while ((boundary = buffered.indexOf("\n\n")) >= 0) {
+			const block = buffered.slice(0, boundary);
+			buffered = buffered.slice(boundary + 2);
+			const data = block
+			  .split("\n")
+			  .filter((line) => line.startsWith("data:"))
+			  .map((line) => line.slice(5).trimStart())
+			  .join("\n");
+			if (data) onMessage(data);
+		  }
+		}
+	  } catch {}
+	  if (!controller.signal.aborted) {
+		await new Promise((resolve) => setTimeout(resolve, 2_000));
+	  }
+	}
+  })().catch(() => {});
+  return { close: () => controller.abort() };
 }
 
 const CODEX_MUX_ACCOUNT_SCOPED_PLUGIN_METHODS = new Set([
@@ -245,7 +283,7 @@ function CodexMuxAccountMenu() {
       );
       setAccounts(nextAccounts);
       setError("");
-      if (nextAccounts.some((account) => account.connected)) setLoading(false);
+	  setLoading(false);
     } catch (requestError) {
       setError(requestError.message);
       setLoading(false);
@@ -254,12 +292,9 @@ function CodexMuxAccountMenu() {
 
   kXc.useEffect(() => {
     refresh();
-    const events = new EventSource(
-      `${CODEX_MUX_API}/events?token=${encodeURIComponent(CODEX_MUX_TOKEN)}`,
-    );
-    events.onmessage = (event) => {
+    const events = codexMuxSubscribeEvents((data) => {
       try {
-        const payload = JSON.parse(event.data);
+        const payload = JSON.parse(data);
         if (
           payload.type === "account-updated" &&
           payload.accountId === loginAccountId
@@ -267,57 +302,52 @@ function CodexMuxAccountMenu() {
           codexMuxLoginActive = false;
           setLogin(null);
         }
-        if (payload.type === "account-updated") refresh();
+		if (payload.type === "account-updated" || payload.type === "account-removed") refresh();
       } catch {}
-    };
-    const warmupTimer = setTimeout(refresh, 2_000);
-    const loadingDeadline = setTimeout(() => {
-      refresh().finally(() => setLoading(false));
-    }, 6_000);
-    const timer = setInterval(refresh, 30_000);
-    return () => {
-      clearTimeout(warmupTimer);
-      clearTimeout(loadingDeadline);
-      clearInterval(timer);
-      events.close();
+    });
+	return () => {
+	  events.close();
     };
   }, [refresh, loginAccountId]);
 
   kXc.useEffect(() => {
-    if (!login) return;
-    const allowEscapeDismissal = (event) => {
-      if (event.key !== "Escape") return;
-      codexMuxLoginActive = false;
-      setLogin(null);
-    };
+	if (!login) return;
+	const allowEscapeDismissal = async (event) => {
+	  if (event.key !== "Escape") return;
+	  const accountId = login.accountId;
+	  codexMuxLoginActive = false;
+	  setLogin(null);
+	  try {
+		await codexMuxRequest(`/accounts/${encodeURIComponent(accountId)}`, {
+		  method: "DELETE",
+		});
+		await refresh();
+	  } catch (requestError) {
+		setError(requestError.message);
+	  }
+	};
     window.addEventListener("keydown", allowEscapeDismissal, true);
     return () => window.removeEventListener("keydown", allowEscapeDismissal, true);
   }, [login]);
 
   const connected = accounts.filter(
-    (account) => account.connected && account.enabled,
+	(account) => account.connected && account.enabled,
   );
-  const weeklyWindows = connected.map((account) =>
-    codexMuxWeeklyWindow(account.rateLimits),
-  );
-  const hasCompleteUsage =
-    connected.length > 0 && weeklyWindows.every((weekly) => weekly != null);
-  const totalRemaining = weeklyWindows.reduce(
-    (total, weekly) =>
-      total + (weekly == null ? 0 : Math.max(0, 100 - weekly.usedPercent)),
-    0,
-  );
-
+	const incomplete = accounts.filter(
+	(account) => !account.controller && !account.connected && !account.error,
+	);
   async function addSubscription(event) {
     event.preventDefault();
     if (busy) return;
     setBusy(true);
     setError("");
-    try {
-      const created = await codexMuxRequest("/accounts", {
-        method: "POST",
-        body: JSON.stringify({ label: `Subscription ${connected.length + 1}` }),
-      });
+	let createdAccountId = null;
+	try {
+	  const created = await codexMuxRequest("/accounts", {
+		method: "POST",
+		body: JSON.stringify({ label: "" }),
+	  });
+	  createdAccountId = created.account.id;
       const result = await codexMuxRequest(`/accounts/${created.account.id}/login`, {
         method: "POST",
         body: JSON.stringify({ mode: "chatgptDeviceCode" }),
@@ -329,8 +359,15 @@ function CodexMuxAccountMenu() {
       setCodeCopied(false);
       setLogin(pendingLogin);
       await refresh();
-    } catch (requestError) {
-      setError(requestError.message);
+	} catch (requestError) {
+	  if (createdAccountId) {
+		try {
+		  await codexMuxRequest(`/accounts/${encodeURIComponent(createdAccountId)}`, {
+			method: "DELETE",
+		  });
+		} catch {}
+	  }
+	  setError(requestError.message);
     } finally {
       setBusy(false);
     }
@@ -376,16 +413,12 @@ function CodexMuxAccountMenu() {
           : connected.length === 1
             ? "1 connected subscription"
             : `${connected.length} connected subscriptions`,
-        rightIcon: (0, e7.jsx)("span", {
-          className: "text-token-description-foreground tabular-nums",
-          children: loading
-            ? "…"
-            : hasCompleteUsage
-              ? `${Math.round(totalRemaining)}%`
-              : "–",
-        }),
-        onSelect: () => BW(modalScope, CodexMuxUsageModal, {}),
-        children: "Usage remaining",
+		rightIcon: (0, e7.jsx)("span", {
+		  className: "text-token-description-foreground tabular-nums",
+		  children: loading ? "…" : `${connected.length}`,
+		}),
+		onSelect: () => BW(modalScope, CodexMuxUsageModal, {}),
+		children: "Subscription pool",
       },
       "codex-mux-total",
     ),
@@ -424,6 +457,35 @@ function CodexMuxAccountMenu() {
         `codex-mux-account-${account.id}`,
       ),
     );
+  }
+
+  for (const account of incomplete) {
+	rows.push(
+	  (0, e7.jsx)(
+		_H,
+		{
+		  LeftIcon: S2,
+		  SubText: "Sign-in incomplete · Click to remove",
+		  tone: "danger",
+		  onSelect: async () => {
+			if (busy) return;
+			setBusy(true);
+			try {
+			  await codexMuxRequest(`/accounts/${encodeURIComponent(account.id)}`, {
+				method: "DELETE",
+			  });
+			  await refresh();
+			} catch (requestError) {
+			  setError(requestError.message);
+			} finally {
+			  setBusy(false);
+			}
+		  },
+		  children: account.label,
+		},
+		`codex-mux-incomplete-${account.id}`,
+	  ),
+	);
   }
 
   if (login) {

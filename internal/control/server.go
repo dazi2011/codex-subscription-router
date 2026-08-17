@@ -200,21 +200,32 @@ func (s *Server) accountAction(response http.ResponseWriter, request *http.Reque
 	ctx, cancel := context.WithTimeout(request.Context(), 30*time.Second)
 	defer cancel()
 
-	if len(parts) == 1 && request.Method == http.MethodPatch {
-		var input struct {
-			Label   *string `json:"label"`
-			Enabled *bool   `json:"enabled"`
+	if len(parts) == 1 {
+		switch request.Method {
+		case http.MethodPatch:
+			var input struct {
+				Label   *string `json:"label"`
+				Enabled *bool   `json:"enabled"`
+			}
+			if err := decodeJSON(request, &input); err != nil {
+				writeJSON(response, http.StatusBadRequest, map[string]any{"error": err.Error()})
+				return
+			}
+			account, err := s.mux.UpdateAccount(ctx, accountID, input.Label, input.Enabled)
+			if err != nil {
+				writeJSON(response, http.StatusBadRequest, map[string]any{"error": err.Error()})
+				return
+			}
+			writeJSON(response, http.StatusOK, map[string]any{"account": account})
+		case http.MethodDelete:
+			if err := s.mux.RemoveAccount(ctx, accountID); err != nil {
+				writeJSON(response, http.StatusBadRequest, map[string]any{"error": err.Error()})
+				return
+			}
+			writeJSON(response, http.StatusOK, map[string]any{"ok": true})
+		default:
+			methodNotAllowed(response)
 		}
-		if err := decodeJSON(request, &input); err != nil {
-			writeJSON(response, http.StatusBadRequest, map[string]any{"error": err.Error()})
-			return
-		}
-		account, err := s.mux.UpdateAccount(ctx, accountID, input.Label, input.Enabled)
-		if err != nil {
-			writeJSON(response, http.StatusBadRequest, map[string]any{"error": err.Error()})
-			return
-		}
-		writeJSON(response, http.StatusOK, map[string]any{"account": account})
 		return
 	}
 	if len(parts) == 2 && parts[1] == "rate-limit-resets" && request.Method == http.MethodGet {
@@ -315,9 +326,6 @@ func (s *Server) events(response http.ResponseWriter, request *http.Request) {
 
 func (s *Server) authorized(request *http.Request) bool {
 	provided := request.Header.Get("X-Codex-Mux-Token")
-	if provided == "" {
-		provided = request.URL.Query().Get("token")
-	}
 	return len(provided) == len(s.token) && subtle.ConstantTimeCompare([]byte(provided), []byte(s.token)) == 1
 }
 
@@ -328,7 +336,7 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 			response.Header().Set("Vary", "Origin")
 		}
 		response.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Codex-Mux-Token")
-		response.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS")
+		response.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
 		response.Header().Set("Cache-Control", "no-store")
 		response.Header().Set("Referrer-Policy", "no-referrer")
 		response.Header().Set("X-Content-Type-Options", "nosniff")

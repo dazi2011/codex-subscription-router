@@ -39,6 +39,7 @@ type AccountSnapshot struct {
 	Enabled         bool            `json:"enabled"`
 	Controller      bool            `json:"controller"`
 	Connected       bool            `json:"connected"`
+	Healthy         bool            `json:"healthy"`
 	Email           string          `json:"email,omitempty"`
 	PlanType        string          `json:"planType,omitempty"`
 	PlanLabel       string          `json:"planLabel,omitempty"`
@@ -70,6 +71,10 @@ func (m *Multiplexer) accountSnapshots(ctx context.Context, includeProfile bool)
 	results := make(chan AccountSnapshot, len(accounts))
 	for _, account := range accounts {
 		go func(account state.Account) {
+			if !account.Enabled {
+				results <- m.storedAccountSnapshot(account)
+				return
+			}
 			snapshot, err := m.accountSnapshotWithProfile(ctx, account.ID, includeProfile)
 			if err != nil {
 				snapshot = AccountSnapshot{
@@ -104,16 +109,72 @@ func (m *Multiplexer) AddAccount(ctx context.Context, label string) (AccountSnap
 		return AccountSnapshot{}, err
 	}
 	if _, err := m.startChild(ctx, account); err != nil {
+		_, _ = m.store.RemoveAccount(account.ID)
 		return AccountSnapshot{}, err
 	}
 	return m.accountSnapshot(ctx, account.ID)
 }
 
 func (m *Multiplexer) UpdateAccount(ctx context.Context, id string, label *string, enabled *bool) (AccountSnapshot, error) {
-	if _, err := m.store.UpdateAccount(id, label, enabled); err != nil {
+	account, err := m.store.UpdateAccount(id, label, enabled)
+	if err != nil {
 		return AccountSnapshot{}, err
 	}
+	if enabled != nil && !*enabled {
+		if err := m.stopChild(ctx, id); err != nil {
+			return AccountSnapshot{}, err
+		}
+		return m.storedAccountSnapshot(account), nil
+	}
+	if enabled != nil && *enabled {
+		if _, err := m.startChild(ctx, account); err != nil {
+			disabled := false
+			_, _ = m.store.UpdateAccount(id, nil, &disabled)
+			return AccountSnapshot{}, fmt.Errorf("enable account: %w", err)
+		}
+	}
+	if _, ok := m.child(id); !ok {
+		return m.storedAccountSnapshot(account), nil
+	}
 	return m.accountSnapshot(ctx, id)
+}
+
+func (m *Multiplexer) RemoveAccount(ctx context.Context, id string) error {
+	account, ok := m.store.Account(id)
+	if !ok {
+		return fmt.Errorf("account %q not found", id)
+	}
+	if account.Controller {
+		return errors.New("the primary subscription cannot be removed")
+	}
+	if err := m.stopChild(ctx, id); err != nil {
+		return err
+	}
+	if _, err := m.store.RemoveAccount(id); err != nil {
+		if account.Enabled {
+			_, _ = m.startChild(context.Background(), account)
+		}
+		return err
+	}
+	m.profileMu.Lock()
+	delete(m.profileCache, id)
+	m.profileMu.Unlock()
+	m.resetCreditsMu.Lock()
+	delete(m.resetCreditsCache, id)
+	m.resetCreditsMu.Unlock()
+	m.resetPreviewMu.Lock()
+	delete(m.resetPreviews, id)
+	m.resetPreviewMu.Unlock()
+	m.publish(Event{Type: "account-removed", AccountID: id})
+	return nil
+}
+
+func (m *Multiplexer) storedAccountSnapshot(account state.Account) AccountSnapshot {
+	return AccountSnapshot{
+		ID: account.ID, Label: account.Label, Enabled: account.Enabled,
+		Controller: account.Controller, CreatedAt: account.CreatedAt,
+		ThreadCount: m.store.ThreadCounts()[account.ID],
+	}
 }
 
 func (m *Multiplexer) ThreadAccount(ctx context.Context, threadID string) (AccountSnapshot, error) {
@@ -128,9 +189,9 @@ func (m *Multiplexer) StartLogin(ctx context.Context, id, mode string) (json.Raw
 	if mode != "chatgpt" && mode != "chatgptDeviceCode" {
 		return nil, errors.New("login mode must be chatgpt or chatgptDeviceCode")
 	}
-	child, ok := m.child(id)
-	if !ok {
-		return nil, fmt.Errorf("account %q is unavailable", id)
+	child, err := m.ensureChild(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("account %q is unavailable: %w", id, err)
 	}
 	params, _ := json.Marshal(map[string]any{"type": mode})
 	response, err := child.Request(ctx, "account/login/start", params)
@@ -141,11 +202,11 @@ func (m *Multiplexer) StartLogin(ctx context.Context, id, mode string) (json.Raw
 }
 
 func (m *Multiplexer) Logout(ctx context.Context, id string) error {
-	child, ok := m.child(id)
-	if !ok {
-		return fmt.Errorf("account %q is unavailable", id)
+	child, err := m.ensureChild(ctx, id)
+	if err != nil {
+		return fmt.Errorf("account %q is unavailable: %w", id, err)
 	}
-	_, err := child.Request(ctx, "account/logout", nil)
+	_, err = child.Request(ctx, "account/logout", nil)
 	return err
 }
 
@@ -158,9 +219,9 @@ func (m *Multiplexer) accountSnapshotWithProfile(ctx context.Context, accountID 
 	if !ok {
 		return AccountSnapshot{}, fmt.Errorf("account %q not found", accountID)
 	}
-	child, ok := m.child(accountID)
-	if !ok {
-		return AccountSnapshot{}, fmt.Errorf("account %q app-server is unavailable", accountID)
+	child, err := m.ensureChild(ctx, accountID)
+	if err != nil {
+		return AccountSnapshot{}, fmt.Errorf("account %q app-server is unavailable: %w", accountID, err)
 	}
 	params := json.RawMessage(`{"refreshToken":false}`)
 	accountResponse, err := child.Request(ctx, "account/read", params)
@@ -176,7 +237,7 @@ func (m *Multiplexer) accountSnapshotWithProfile(ctx context.Context, accountID 
 	snapshot := AccountSnapshot{
 		ID: account.ID, Label: account.Label, Enabled: account.Enabled,
 		Controller: account.Controller, Connected: string(accountResult.Account) != "null" && len(accountResult.Account) > 0,
-		CreatedAt: account.CreatedAt, RawAccount: accountResult.Account,
+		Healthy: true, CreatedAt: account.CreatedAt, RawAccount: accountResult.Account,
 		ThreadCount: m.store.ThreadCounts()[account.ID],
 	}
 	if snapshot.Connected {
@@ -234,12 +295,16 @@ func planLabel(planType string) string {
 	}
 }
 
-func (m *Multiplexer) chooseAccount(ctx context.Context) (state.Account, RouteReason, error) {
-	return m.chooseAccountExcluding(ctx, nil)
+func (m *Multiplexer) chooseAccountForModel(ctx context.Context, model string) (state.Account, RouteReason, error) {
+	return m.chooseAccountForModelExcluding(ctx, nil, model)
 }
 
-func (m *Multiplexer) chooseAccountExcluding(ctx context.Context, excluded map[string]struct{}) (state.Account, RouteReason, error) {
+func (m *Multiplexer) chooseAccountForModelExcluding(ctx context.Context, excluded map[string]struct{}, model string) (state.Account, RouteReason, error) {
 	snapshots := m.accountSnapshots(ctx, false)
+	capable := make(map[string]bool)
+	if model != "" {
+		capable = m.modelCapableAccounts(ctx, snapshots, model)
+	}
 	type candidate struct {
 		account      state.Account
 		reason       RouteReason
@@ -257,12 +322,15 @@ func (m *Multiplexer) chooseAccountExcluding(ctx context.Context, excluded map[s
 		if !snapshot.Enabled || !snapshot.Connected || snapshot.AuthType != "chatgpt" {
 			continue
 		}
+		if model != "" && !capable[snapshot.ID] {
+			continue
+		}
 		account, ok := m.store.Account(snapshot.ID)
 		if !ok {
 			continue
 		}
 		weekly, short := longestAndShortestWindow(snapshot.RateLimits)
-		if weekly != nil && weekly.UsedPercent >= 100 {
+		if weekly == nil || weekly.UsedPercent >= 100 {
 			continue
 		}
 		weeklyUsed := 1_000.0
@@ -286,6 +354,9 @@ func (m *Multiplexer) chooseAccountExcluding(ctx context.Context, excluded map[s
 		})
 	}
 	if len(candidates) == 0 {
+		if model != "" && len(capable) == 0 {
+			return state.Account{}, RouteReason{}, fmt.Errorf("%w: %s", errNoModelCapableSubscription, model)
+		}
 		return state.Account{}, RouteReason{}, errNoSubscriptionCapacity
 	}
 
@@ -389,17 +460,25 @@ func aggregateRateLimits(snapshots []AccountSnapshot) (*RateLimits, error) {
 	secondary := make([]*RateLimitWindow, 0, len(snapshots))
 	hasSubscription := false
 	hasCapacity := false
+	planType := ""
+	hasPlanType := false
 	for _, snapshot := range snapshots {
 		if !snapshot.Enabled || !snapshot.Connected || snapshot.AuthType != "chatgpt" {
 			continue
 		}
 		hasSubscription = true
+		if !hasPlanType {
+			planType = snapshot.PlanType
+			hasPlanType = true
+		} else if snapshot.PlanType != planType {
+			return nil, errors.New("mixed subscription plans cannot be represented as one usage percentage")
+		}
 		if snapshot.RateLimits != nil {
 			primary = append(primary, snapshot.RateLimits.Primary)
 			secondary = append(secondary, snapshot.RateLimits.Secondary)
 		}
 		weekly, _ := longestAndShortestWindow(snapshot.RateLimits)
-		if weekly == nil || weekly.UsedPercent < 100 {
+		if weekly != nil && weekly.UsedPercent < 100 {
 			hasCapacity = true
 		}
 	}

@@ -19,7 +19,7 @@ func TestFetchProfileImageURL(t *testing.T) {
 		}
 		response.Header().Set("Content-Type", "application/json")
 		_, _ = response.Write([]byte(`{
-			"profile":{"profile_picture_url":"https://example.com/wanted.png"}
+			"profile":{"profile_picture_url":"https://images.openai.com/wanted.png"}
 		}`))
 	}))
 	defer server.Close()
@@ -40,7 +40,7 @@ func TestFetchProfileImageURL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if imageURL != "https://example.com/wanted.png" {
+	if imageURL != "https://images.openai.com/wanted.png" {
 		t.Fatalf("unexpected image URL %q", imageURL)
 	}
 }
@@ -48,5 +48,11 @@ func TestFetchProfileImageURL(t *testing.T) {
 func TestValidatedProfileImageURLRejectsNonHTTPS(t *testing.T) {
 	if _, err := validatedProfileImageURL("http://example.com/avatar.png"); err == nil {
 		t.Fatal("expected an insecure profile URL to be rejected")
+	}
+}
+
+func TestValidatedProfileImageURLRejectsUnknownHost(t *testing.T) {
+	if _, err := validatedProfileImageURL("https://example.com/avatar.png"); err == nil {
+		t.Fatal("expected an unknown profile image host to be rejected")
 	}
 }

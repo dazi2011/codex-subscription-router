@@ -17,7 +17,8 @@ OAuth material stays in `auth.json` under each account's Codex home. The
 multiplexer reads an account token only to call the same authenticated ChatGPT
 profile and rate-limit-reset endpoints used by the desktop experience. It does
 not log or return tokens. State persisted by the mux contains account paths,
-labels, enabled state, and thread ownership only.
+labels, enabled state, thread ownership, and the concrete model required by a
+thread only.
 
 The state root is mode `0700`; state, config, and control-token files are mode
 `0600`. Existing control tokens are validated as 256-bit hexadecimal values and
@@ -33,7 +34,16 @@ shared plugin configuration.
 
 The control server binds to `127.0.0.1`. Private endpoints require the token
 embedded into the independently built local renderer. Profile images must use
-HTTPS. Response sizes and JSON request bodies are bounded.
+HTTPS and an OpenAI, ChatGPT, OAI content, or explicitly supported Google
+profile-image host. Response sizes and JSON request bodies are bounded. Event
+stream authentication uses a header so the token does not enter URLs or URL
+diagnostics. The server fails closed if port 48123 is occupied or if its token
+file no longer matches the built renderer.
+
+The renderer needs account-control privileges to implement the account UI, so
+the embedded token is not an isolation boundary against renderer compromise.
+It is a request-authentication mechanism against unrelated web origins. A
+renderer code-execution flaw must be treated as control API compromise.
 
 The project itself does not provide a telemetry or update endpoint. Network
 traffic beyond loopback is performed by the official Codex children or by the

@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"context"
-	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -13,7 +12,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -59,6 +57,14 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	token, err := loadOrCreateToken(root)
+	if err != nil {
+		return err
+	}
+	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", defaultControlPort))
+	if err != nil {
+		return fmt.Errorf("bind account control server: %w", err)
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -70,44 +76,31 @@ func run() error {
 		Output:         os.Stdout,
 	})
 	if err != nil {
+		_ = listener.Close()
 		return err
 	}
 	if err := multiplexer.Start(ctx); err != nil {
+		_ = listener.Close()
 		return err
 	}
 	defer multiplexer.Close()
 
-	token, err := loadOrCreateToken(root)
-	if err != nil {
-		return err
-	}
-	port := defaultControlPort
-	if value := os.Getenv("CODEX_MUX_CONTROL_PORT"); value != "" {
-		if parsed, parseErr := strconv.Atoi(value); parseErr == nil && parsed > 0 && parsed <= 65535 {
-			port = parsed
+	controlServer := control.New(
+		listener.Addr().String(),
+		token,
+		multiplexer,
+		os.Getenv("CODEX_MUX_UI_TESTS") == "1",
+	)
+	go func() {
+		if serveErr := controlServer.Serve(listener); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			fmt.Fprintf(os.Stderr, "codex-mux: control server: %v\n", serveErr)
 		}
-	}
-	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "codex-mux: account UI unavailable: %v\n", err)
-	} else {
-		controlServer := control.New(
-			listener.Addr().String(),
-			token,
-			multiplexer,
-			os.Getenv("CODEX_MUX_UI_TESTS") == "1",
-		)
-		go func() {
-			if serveErr := controlServer.Serve(listener); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
-				fmt.Fprintf(os.Stderr, "codex-mux: control server: %v\n", serveErr)
-			}
-		}()
-		defer func() {
-			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer shutdownCancel()
-			_ = controlServer.Shutdown(shutdownCtx)
-		}()
-	}
+	}()
+	defer func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer shutdownCancel()
+		_ = controlServer.Shutdown(shutdownCtx)
+	}()
 
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 64*1024), 64*1024*1024)
@@ -172,7 +165,7 @@ func passthrough(realExecutable string, args []string) error {
 
 func loadOrCreateToken(root string) (string, error) {
 	if configured := os.Getenv("CODEX_MUX_CONTROL_TOKEN"); configured != "" {
-		return validateControlToken(configured)
+		return "", errors.New("CODEX_MUX_CONTROL_TOKEN is unsupported because the renderer and server must use the build token")
 	}
 	path := filepath.Join(root, "control-token")
 	if data, err := os.ReadFile(path); err == nil {
@@ -187,15 +180,7 @@ func loadOrCreateToken(root string) (string, error) {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return "", fmt.Errorf("read control token: %w", err)
 	}
-	bytes := make([]byte, 32)
-	if _, err := rand.Read(bytes); err != nil {
-		return "", fmt.Errorf("generate control token: %w", err)
-	}
-	token := hex.EncodeToString(bytes)
-	if err := os.WriteFile(path, []byte(token), 0o600); err != nil {
-		return "", fmt.Errorf("write control token: %w", err)
-	}
-	return token, nil
+	return "", fmt.Errorf("control token is missing at %s; rebuild the app to create a matching renderer and server token", path)
 }
 
 func validateControlToken(value string) (string, error) {

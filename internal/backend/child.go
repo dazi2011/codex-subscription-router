@@ -84,6 +84,19 @@ func (c *Child) AccountID() string {
 	return c.accountID
 }
 
+func (c *Child) Done() <-chan struct{} {
+	return c.closed
+}
+
+func (c *Child) IsClosed() bool {
+	select {
+	case <-c.closed:
+		return true
+	default:
+		return false
+	}
+}
+
 func (c *Child) Send(message protocol.Message) error {
 	encoded, err := protocol.Encode(message)
 	if err != nil {
@@ -141,6 +154,13 @@ func (c *Child) Close() error {
 		return nil
 	}
 	return c.command.Process.Signal(os.Interrupt)
+}
+
+func (c *Child) Kill() error {
+	if c.command.Process == nil || c.IsClosed() {
+		return nil
+	}
+	return c.command.Process.Kill()
 }
 
 func (c *Child) readLoop(stdout io.Reader) {

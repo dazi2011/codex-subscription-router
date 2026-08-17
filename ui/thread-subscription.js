@@ -1,6 +1,44 @@
 const CODEX_MUX_THREAD_API = "http://127.0.0.1:__CODEX_MUX_CONTROL_PORT__/v1";
 const CODEX_MUX_THREAD_TOKEN = "__CODEX_MUX_CONTROL_TOKEN__";
 
+function codexMuxThreadSubscribeEvents(onMessage) {
+  const controller = new AbortController();
+  (async () => {
+	while (!controller.signal.aborted) {
+	  try {
+		const response = await fetch(`${CODEX_MUX_THREAD_API}/events`, {
+		  headers: { "X-Codex-Mux-Token": CODEX_MUX_THREAD_TOKEN },
+		  signal: controller.signal,
+		});
+		if (!response.ok || !response.body) throw new Error("event stream unavailable");
+		const reader = response.body.getReader();
+		const decoder = new TextDecoder();
+		let buffered = "";
+		while (true) {
+		  const { done, value } = await reader.read();
+		  if (done) break;
+		  buffered += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+		  let boundary;
+		  while ((boundary = buffered.indexOf("\n\n")) >= 0) {
+			const block = buffered.slice(0, boundary);
+			buffered = buffered.slice(boundary + 2);
+			const data = block
+			  .split("\n")
+			  .filter((line) => line.startsWith("data:"))
+			  .map((line) => line.slice(5).trimStart())
+			  .join("\n");
+			if (data) onMessage(data);
+		  }
+		}
+	  } catch {}
+	  if (!controller.signal.aborted) {
+		await new Promise((resolve) => setTimeout(resolve, 2_000));
+	  }
+	}
+  })().catch(() => {});
+  return { close: () => controller.abort() };
+}
+
 function CodexMuxThreadSubscription() {
   const route = $n(sr);
   const threadId =
@@ -31,12 +69,9 @@ function CodexMuxThreadSubscription() {
     };
 
     refresh();
-    const events = new EventSource(
-      `${CODEX_MUX_THREAD_API}/events?token=${encodeURIComponent(CODEX_MUX_THREAD_TOKEN)}`,
-    );
-    events.onmessage = (event) => {
+    const events = codexMuxThreadSubscribeEvents((data) => {
       try {
-        const payload = JSON.parse(event.data);
+        const payload = JSON.parse(data);
         if (
           payload.type === "account-updated" ||
           (payload.type === "thread-failed-over" &&
@@ -45,14 +80,10 @@ function CodexMuxThreadSubscription() {
           refresh();
         }
       } catch {}
-    };
-    const warmupTimer = setTimeout(refresh, 2_000);
-    const timer = setInterval(refresh, 30_000);
-    return () => {
-      active = false;
-      clearTimeout(warmupTimer);
-      clearInterval(timer);
-      events.close();
+    });
+	return () => {
+	  active = false;
+	  events.close();
     };
   }, [threadId]);
 
