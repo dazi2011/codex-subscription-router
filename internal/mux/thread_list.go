@@ -19,6 +19,8 @@ const (
 
 type threadListCursorState struct {
 	threads   []map[string]any
+	position  int
+	step      int
 	pageSize  int
 	expiresAt time.Time
 }
@@ -122,7 +124,8 @@ func (m *Multiplexer) aggregateThreadList(request protocol.Message) {
 	}
 	sortThreads(threads, request.Params)
 	m.writeThreadListPage(request, threadListCursorState{
-		threads: threads, pageSize: threadListPageSize(request.Params, defaultThreadListPageSize),
+		threads: threads, position: 0, step: 1,
+		pageSize: threadListPageSize(request.Params, defaultThreadListPageSize),
 	})
 }
 
@@ -153,17 +156,37 @@ func threadListPageSize(params json.RawMessage, fallback int) int {
 
 func (m *Multiplexer) writeThreadListPage(request protocol.Message, state threadListCursorState) {
 	limit := threadListPageSize(request.Params, state.pageSize)
-	if limit > len(state.threads) {
-		limit = len(state.threads)
+	if state.step != -1 {
+		state.step = 1
 	}
-	page := state.threads[:limit]
+	page := make([]map[string]any, 0, limit)
+	position := state.position
+	firstPosition := -1
+	for len(page) < limit && position >= 0 && position < len(state.threads) {
+		if firstPosition < 0 {
+			firstPosition = position
+		}
+		page = append(page, state.threads[position])
+		position += state.step
+	}
 	var nextCursor any
-	if limit < len(state.threads) {
-		state.threads = state.threads[limit:]
-		state.pageSize = limit
-		nextCursor = m.storeThreadListCursor(state)
+	if position >= 0 && position < len(state.threads) {
+		nextState := state
+		nextState.position = position
+		nextState.pageSize = limit
+		nextCursor = m.storeThreadListCursor(nextState)
 	}
-	encoded, err := json.Marshal(map[string]any{"data": page, "nextCursor": nextCursor})
+	var backwardsCursor any
+	if firstPosition >= 0 {
+		backwardsState := state
+		backwardsState.position = firstPosition - state.step
+		backwardsState.step = -state.step
+		backwardsState.pageSize = limit
+		backwardsCursor = m.storeThreadListCursor(backwardsState)
+	}
+	encoded, err := json.Marshal(map[string]any{
+		"data": page, "nextCursor": nextCursor, "backwardsCursor": backwardsCursor,
+	})
 	if err != nil {
 		m.write(protocol.Failure(request.ID, -32603, "failed to merge thread list"))
 		return

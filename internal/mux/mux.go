@@ -43,6 +43,7 @@ type externalRoute struct {
 
 type serverRequestRoute struct {
 	accountID string
+	method    string
 	original  json.RawMessage
 	forwarded json.RawMessage
 	responded bool
@@ -60,6 +61,8 @@ type internalResumeSuppression struct {
 	key         string
 	started     chan struct{}
 	startedSeen bool
+	capture     bool
+	captured    [][]byte
 }
 
 type Event struct {
@@ -384,7 +387,7 @@ func (m *Multiplexer) routeExistingRequest(message protocol.Message) {
 		go m.routeTurnStart(message, threadID, accountID)
 		return
 	}
-	if (message.Method == "thread/resume" || message.Method == "thread/fork") &&
+	if capabilityAwareThreadOverrideMethod(message.Method) &&
 		threadID != "" && !modelRequirementFromParams(message.Params).empty() {
 		go m.routeThreadCapabilityOverride(message, threadID, accountID)
 		return
@@ -392,6 +395,10 @@ func (m *Multiplexer) routeExistingRequest(message protocol.Message) {
 	if err := m.forward(accountID, message); err != nil {
 		m.write(protocol.Failure(message.ID, -32023, err.Error()))
 	}
+}
+
+func capabilityAwareThreadOverrideMethod(method string) bool {
+	return method == "thread/resume" || method == "thread/fork" || method == "thread/settings/update"
 }
 
 func (m *Multiplexer) forward(accountID string, message protocol.Message) error {
@@ -459,7 +466,7 @@ func (m *Multiplexer) routeTurnStart(message protocol.Message, threadID, ownerID
 	effective := storedModelRequirement(m.store.ThreadCapability(threadID)).overlay(requested)
 	if err == nil && accountEligibleForRouting(snapshot) &&
 		accountQuotaState(snapshot) != quotaCapacityExhausted {
-		if requested.empty() {
+		if effective.Model == "" {
 			if err := m.forward(ownerID, message); err != nil {
 				m.write(protocol.Failure(message.ID, -32023, err.Error()))
 			}
@@ -533,24 +540,28 @@ func (m *Multiplexer) failoverTurn(
 		}
 		return
 	}
-	targetCapability, err := m.resumeThreadOnAccount(ctx, resume, fallback.ID)
+	targetInfo, targetSuppression, err := m.resumeThreadOnAccount(ctx, resume, fallback.ID)
 	if err != nil {
 		m.write(protocol.Failure(message.ID, -32027, fmt.Sprintf("move chat to %s: %v", fallback.Label, err)))
 		return
 	}
+	targetCapability := targetInfo.Capability
 	forwardCapability := requirement.overlay(targetCapability)
 	if requirement.EffortKnown {
-		// thread/resume cannot carry effort. Preserve the source/current-turn
-		// effort on the pending turn even if the target resume response reports
-		// its pre-turn setting.
+		// Preserve the source/current-turn effort on the pending turn even when
+		// the target resume response normalizes its next-turn setting.
 		forwardCapability.Effort = requirement.Effort
 		forwardCapability.EffortKnown = true
 	}
 	if err := m.store.CompareAndSwapThreadOwner(threadID, sourceAccountID, fallback.ID); err != nil {
+		_ = m.finishInternalResume(targetSuppression)
+		go m.unsubscribeThreadOnAccount(fallback.ID, threadID)
 		m.write(protocol.Failure(message.ID, -32028, err.Error()))
 		return
 	}
 	if err := m.store.UpdateThreadCapability(threadID, stateCapabilityUpdate(targetCapability)); err != nil {
+		_ = m.finishInternalResume(targetSuppression)
+		go m.unsubscribeThreadOnAccount(fallback.ID, threadID)
 		if rollbackErr := m.store.CompareAndSwapThreadOwner(threadID, fallback.ID, sourceAccountID); rollbackErr != nil {
 			m.write(protocol.Failure(message.ID, -32028, fmt.Sprintf("persist target chat settings: %v; owner rollback failed: %v", err, rollbackErr)))
 		} else {
@@ -560,6 +571,8 @@ func (m *Multiplexer) failoverTurn(
 	}
 	message.Params = paramsWithModelRequirement(message.Params, forwardCapability)
 	if err := m.forward(fallback.ID, message); err != nil {
+		_ = m.finishInternalResume(targetSuppression)
+		go m.unsubscribeThreadOnAccount(fallback.ID, threadID)
 		if rollbackErr := m.store.CompareAndSwapThreadOwner(threadID, fallback.ID, sourceAccountID); rollbackErr != nil {
 			m.write(protocol.Failure(message.ID, -32023, fmt.Sprintf("%v; owner rollback failed: %v", err, rollbackErr)))
 		} else {
@@ -571,6 +584,8 @@ func (m *Multiplexer) failoverTurn(
 		}
 		return
 	}
+	targetNotifications := m.finishInternalResume(targetSuppression)
+	m.replayCapturedNotifications(fallback.ID, targetNotifications)
 	go m.unsubscribeThreadOnAccount(sourceAccountID, threadID)
 	m.publish(Event{
 		Type:      "thread-failed-over",
@@ -680,9 +695,9 @@ func (m *Multiplexer) readThreadResumeInfo(
 		wasLoaded, loadedKnown = m.threadLoadedOnAccount(ctx, sourceAccountID, source, threadID)
 	}
 	resumeParams, _ := json.Marshal(map[string]any{"threadId": threadID})
-	suppression := m.registerInternalResume(sourceAccountID, threadID)
+	suppression := m.registerInternalResume(sourceAccountID, threadID, false)
 	resumeResponse, err := source.Request(ctx, "thread/resume", resumeParams)
-	m.finishInternalResume(suppression)
+	_ = m.finishInternalResume(suppression)
 	if err != nil {
 		return threadResumeInfo{}, fmt.Errorf("resume existing chat on source subscription: %w", err)
 	}
@@ -701,7 +716,9 @@ func (m *Multiplexer) readThreadResumeInfo(
 	if info.HistoryMode != "paginated" && info.Path == "" {
 		return threadResumeInfo{}, errors.New("existing chat has no resumable history path")
 	}
-	_ = m.store.UpdateThreadCapability(threadID, stateCapabilityUpdate(info.Capability))
+	if err := m.store.UpdateThreadCapability(threadID, stateCapabilityUpdate(info.Capability)); err != nil {
+		return threadResumeInfo{}, fmt.Errorf("persist recovered chat settings: %w", err)
+	}
 	return info, nil
 }
 
@@ -725,24 +742,36 @@ func (m *Multiplexer) threadLoadedOnAccount(
 }
 
 func (m *Multiplexer) unsubscribeThreadOnAccount(accountID, threadID string) {
+	if err := m.unsubscribeThreadOnAccountResult(accountID, threadID); err != nil {
+		fmt.Fprintf(os.Stderr, "codex-mux: unsubscribe compensated thread %s on %s: %v\n", threadID, accountID, err)
+		m.publish(Event{
+			Type: "thread-cleanup-error", AccountID: accountID,
+			Message: "A compensated target thread could not be unsubscribed",
+			Data:    map[string]any{"threadId": threadID, "error": err.Error()},
+		})
+	}
+}
+
+func (m *Multiplexer) unsubscribeThreadOnAccountResult(accountID, threadID string) error {
 	child, ok := m.child(accountID)
 	if !ok {
-		return
+		return errors.New("app-server is unavailable")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), controlRequestTimeout)
 	defer cancel()
 	params, _ := json.Marshal(map[string]any{"threadId": threadID})
-	_, _ = child.Request(ctx, "thread/unsubscribe", params)
+	_, err := child.Request(ctx, "thread/unsubscribe", params)
+	return err
 }
 
 func (m *Multiplexer) resumeThreadOnAccount(
 	ctx context.Context,
 	info threadResumeInfo,
 	targetAccountID string,
-) (modelRequirement, error) {
+) (threadResumeInfo, *internalResumeSuppression, error) {
 	target, err := m.ensureChild(ctx, targetAccountID)
 	if err != nil {
-		return modelRequirement{}, fmt.Errorf("target subscription is unavailable: %w", err)
+		return threadResumeInfo{}, nil, fmt.Errorf("target subscription is unavailable: %w", err)
 	}
 	params := map[string]any{"threadId": info.ID, "history": nil, "path": info.Path}
 	for key, value := range map[string]string{
@@ -755,19 +784,31 @@ func (m *Multiplexer) resumeThreadOnAccount(
 	if info.Capability.ServiceTierKnown {
 		params["serviceTier"] = nullableCapabilityValue(info.Capability.ServiceTier)
 	}
+	if info.Capability.EffortKnown {
+		params["config"] = map[string]any{
+			"model_reasoning_effort": nullableCapabilityValue(info.Capability.Effort),
+		}
+	}
 	resumeParams, _ := json.Marshal(params)
+	suppression := m.registerInternalResume(targetAccountID, info.ID, true)
 	response, err := target.Request(ctx, "thread/resume", resumeParams)
 	if err != nil {
-		return modelRequirement{}, fmt.Errorf("resume existing chat: %w", err)
+		_ = m.finishInternalResume(suppression)
+		go m.unsubscribeThreadOnAccount(targetAccountID, info.ID)
+		return threadResumeInfo{}, nil, fmt.Errorf("resume existing chat: %w", err)
 	}
 	targetInfo, err := threadResumeInfoFromResponse(response.Result)
 	if err != nil {
-		return modelRequirement{}, fmt.Errorf("decode target chat settings: %w", err)
+		_ = m.finishInternalResume(suppression)
+		go m.unsubscribeThreadOnAccount(targetAccountID, info.ID)
+		return threadResumeInfo{}, nil, fmt.Errorf("decode target chat settings: %w", err)
 	}
 	if !targetInfo.Capability.ModelKnown || targetInfo.Capability.Model == "" {
-		return modelRequirement{}, errors.New("target chat response has no effective model")
+		_ = m.finishInternalResume(suppression)
+		go m.unsubscribeThreadOnAccount(targetAccountID, info.ID)
+		return threadResumeInfo{}, nil, errors.New("target chat response has no effective model")
 	}
-	return targetInfo.Capability, nil
+	return targetInfo, suppression, nil
 }
 
 func (m *Multiplexer) handleServerRequestResponse(message protocol.Message) {
@@ -787,12 +828,21 @@ func (m *Multiplexer) handleServerRequestResponse(message protocol.Message) {
 	message.ID = route.original
 	if child, exists := m.child(route.accountID); exists {
 		if child.Send(message) == nil {
+			if serverRequestCompletesOnResponse(route.method) {
+				m.serverMu.Lock()
+				delete(m.serverRoutes, key)
+				m.serverMu.Unlock()
+			}
 			return
 		}
 	}
 	m.serverMu.Lock()
 	delete(m.serverRoutes, key)
 	m.serverMu.Unlock()
+}
+
+func serverRequestCompletesOnResponse(method string) bool {
+	return method == "attestation/generate"
 }
 
 func (m *Multiplexer) inboundLoop(ctx context.Context) {
@@ -829,7 +879,21 @@ func (m *Multiplexer) handleInbound(inbound backend.Inbound) {
 				})
 			}
 			if message.Error == nil {
-				m.learnThreadOwner(route, inbound.AccountID, message.Result)
+				if err := m.learnThreadOwner(route, inbound.AccountID, message.Result); err != nil {
+					threadID := threadIDFromParams(route.message.Params)
+					if threadID == "" {
+						threadID = threadIDFromResult(message.Result)
+					}
+					m.reportRoutingMetadataError(inbound.AccountID, threadID, route.method, err)
+					messageText := fmt.Sprintf(
+						"app-server operation succeeded, but routing metadata could not be persisted: %v", err,
+					)
+					if route.method == "thread/fork" && threadID != "" {
+						messageText = compensationError("persist fork routing metadata", err, m.cleanupFailedFork(inbound.AccountID, threadID))
+					}
+					m.write(protocol.Failure(route.message.ID, -32028, messageText))
+					return
+				}
 			}
 			m.writeRaw(inbound.Raw)
 		}
@@ -844,7 +908,7 @@ func (m *Multiplexer) handleInbound(inbound backend.Inbound) {
 		notificationThreadID = threadIDFromNotification(message.Params)
 	}
 	if notificationThreadID != "" && m.suppressInternalResumeNotification(
-		inbound.AccountID, notificationThreadID, message.Method,
+		inbound.AccountID, notificationThreadID, message.Method, inbound.Raw,
 	) {
 		return
 	}
@@ -854,14 +918,20 @@ func (m *Multiplexer) handleInbound(inbound backend.Inbound) {
 	}
 	if message.Method == "thread/started" {
 		if threadID := threadIDFromNotification(message.Params); threadID != "" {
-			_ = m.store.SetThreadOwnerIfAbsent(threadID, inbound.AccountID)
+			if err := m.store.SetThreadOwnerIfAbsent(threadID, inbound.AccountID); err != nil {
+				m.reportRoutingMetadataError(inbound.AccountID, threadID, message.Method, err)
+			}
 		}
 	}
 	if message.Method == "thread/settings/updated" {
-		m.learnEffectiveThreadSettings(inbound.AccountID, message.Params)
+		if err := m.learnEffectiveThreadSettings(inbound.AccountID, message.Params); err != nil {
+			m.reportRoutingMetadataError(inbound.AccountID, threadIDFromParams(message.Params), message.Method, err)
+		}
 	}
 	if message.Method == "model/rerouted" {
-		m.learnModelReroute(inbound.AccountID, message.Params)
+		if err := m.learnModelReroute(inbound.AccountID, message.Params); err != nil {
+			m.reportRoutingMetadataError(inbound.AccountID, threadIDFromParams(message.Params), message.Method, err)
+		}
 	}
 	if message.Method == "serverRequest/resolved" {
 		if rewritten, ok := m.rewriteServerRequestResolved(inbound.AccountID, message); ok {
@@ -902,6 +972,7 @@ func (m *Multiplexer) forwardServerRequest(inbound backend.Inbound) {
 	m.serverMu.Lock()
 	m.serverRoutes[key] = serverRequestRoute{
 		accountID: inbound.AccountID,
+		method:    inbound.Message.Method,
 		original:  append(json.RawMessage(nil), inbound.Message.ID...),
 		forwarded: append(json.RawMessage(nil), newID...),
 	}
@@ -963,82 +1034,120 @@ func (m *Multiplexer) shouldForwardNotification(accountID string, message protoc
 		strings.HasPrefix(method, "rawResponse")
 }
 
-func (m *Multiplexer) learnThreadOwner(route externalRoute, accountID string, result json.RawMessage) {
+func (m *Multiplexer) learnThreadOwner(route externalRoute, accountID string, result json.RawMessage) error {
 	switch route.method {
 	case "thread/start", "thread/fork", "thread/resume":
 		if threadID := threadIDFromResult(result); threadID != "" {
-			_ = m.store.SetThreadOwner(threadID, accountID)
+			if err := m.store.SetThreadOwner(threadID, accountID); err != nil {
+				return err
+			}
 			if info, err := threadResumeInfoFromResponse(result); err == nil {
-				_ = m.store.UpdateThreadCapability(threadID, stateCapabilityUpdate(info.Capability))
+				if err := m.store.UpdateThreadCapability(threadID, stateCapabilityUpdate(info.Capability)); err != nil {
+					return err
+				}
 			}
 			if route.method == "thread/start" {
 				usesProject, usesSection := threadStartControllerAffinity(route.message.Params)
 				if usesProject {
-					_ = m.store.SetControllerAffinedThread(threadID)
+					if err := m.store.SetControllerAffinedThread(threadID); err != nil {
+						return err
+					}
 				}
 				if usesSection {
-					_ = m.store.SetThreadSectionAffinity(threadID, true)
+					if err := m.store.SetThreadSectionAffinity(threadID, true); err != nil {
+						return err
+					}
 				}
 			}
 			if route.method == "thread/fork" {
-				_ = m.store.CopyControllerAffinity(threadIDFromParams(route.message.Params), threadID)
+				if err := m.store.CopyControllerAffinity(threadIDFromParams(route.message.Params), threadID); err != nil {
+					return err
+				}
 			}
 		}
 	case "thread/unarchive":
 		if threadID := threadIDFromResult(result); threadID != "" {
-			_ = m.store.SetThreadOwner(threadID, accountID)
+			if err := m.store.SetThreadOwner(threadID, accountID); err != nil {
+				return err
+			}
 		}
 	case "turn/start", "thread/settings/update":
 		if threadID := threadIDFromParams(route.message.Params); threadID != "" {
-			_ = m.store.SetThreadOwner(threadID, accountID)
+			if err := m.store.SetThreadOwner(threadID, accountID); err != nil {
+				return err
+			}
 		}
 	case "thread/section/move":
 		if threadID := threadIDFromParams(route.message.Params); threadID != "" {
-			_ = m.store.SetThreadOwner(threadID, accountID)
+			if err := m.store.SetThreadOwner(threadID, accountID); err != nil {
+				return err
+			}
 			var params map[string]any
 			if json.Unmarshal(route.message.Params, &params) == nil {
 				for _, key := range []string{"sectionId", "section_id"} {
 					if sectionID, present := params[key]; present {
-						_ = m.store.SetThreadSectionAffinity(threadID, sectionID != nil && anyString(sectionID) != "")
+						if err := m.store.SetThreadSectionAffinity(threadID, sectionID != nil && anyString(sectionID) != ""); err != nil {
+							return err
+						}
 						break
 					}
 				}
 			}
 		}
 	}
+	return nil
 }
 
-func (m *Multiplexer) learnEffectiveThreadSettings(accountID string, params json.RawMessage) {
+func (m *Multiplexer) learnEffectiveThreadSettings(accountID string, params json.RawMessage) error {
 	var decoded map[string]any
 	if json.Unmarshal(params, &decoded) != nil {
-		return
+		return nil
 	}
 	threadID := anyString(decoded["threadId"])
 	settings, ok := decoded["threadSettings"].(map[string]any)
 	if threadID == "" || !ok || !m.notificationOwnsThread(threadID, accountID) {
-		return
+		return nil
 	}
 	requirement := modelRequirementFromEffectiveSettings(settings, "effort")
-	_ = m.store.UpdateThreadCapability(threadID, stateCapabilityUpdate(requirement))
+	return m.store.UpdateThreadCapability(threadID, stateCapabilityUpdate(requirement))
 }
 
-func (m *Multiplexer) learnModelReroute(accountID string, params json.RawMessage) {
+func (m *Multiplexer) learnModelReroute(accountID string, params json.RawMessage) error {
 	var decoded map[string]any
 	if json.Unmarshal(params, &decoded) != nil {
-		return
+		return nil
 	}
 	threadID := anyString(decoded["threadId"])
 	toModel := anyString(decoded["toModel"])
 	if threadID == "" || toModel == "" || !m.notificationOwnsThread(threadID, accountID) {
-		return
+		return nil
 	}
-	_ = m.store.UpdateThreadCapability(threadID, state.ThreadCapabilityUpdate{Model: &toModel})
+	return m.store.UpdateThreadCapability(threadID, state.ThreadCapabilityUpdate{Model: &toModel})
+}
+
+func (m *Multiplexer) reportRoutingMetadataError(accountID, threadID, operation string, err error) {
+	fmt.Fprintf(os.Stderr, "codex-mux: persist routing metadata for %s on %s: %v\n", operation, accountID, err)
+	m.publish(Event{
+		Type: "routing-metadata-error", AccountID: accountID,
+		Message: "An app-server operation succeeded, but Router metadata persistence failed",
+		Data:    map[string]any{"operation": operation, "error": err.Error()},
+	})
+	params := map[string]any{
+		"message": fmt.Sprintf("Router could not persist routing metadata after %s: %v", operation, err),
+	}
+	if threadID != "" {
+		params["threadId"] = threadID
+	}
+	if encoded, marshalErr := json.Marshal(params); marshalErr == nil {
+		m.write(protocol.Message{Method: "warning", Params: encoded})
+	}
 }
 
 func (m *Multiplexer) notificationOwnsThread(threadID, accountID string) bool {
 	owner, exists := m.store.ThreadOwner(threadID)
 	if !exists {
 		if err := m.store.SetThreadOwnerIfAbsent(threadID, accountID); err != nil {
+			m.reportRoutingMetadataError(accountID, threadID, "notification owner learning", err)
 			return false
 		}
 		owner, exists = m.store.ThreadOwner(threadID)
@@ -1050,10 +1159,11 @@ func internalResumeKey(accountID, threadID string) string {
 	return accountID + "\x00" + threadID
 }
 
-func (m *Multiplexer) registerInternalResume(accountID, threadID string) *internalResumeSuppression {
+func (m *Multiplexer) registerInternalResume(accountID, threadID string, capture bool) *internalResumeSuppression {
 	suppression := &internalResumeSuppression{
 		key:     internalResumeKey(accountID, threadID),
 		started: make(chan struct{}),
+		capture: capture,
 	}
 	m.internalResumeMu.Lock()
 	m.internalResumes[suppression.key] = append(m.internalResumes[suppression.key], suppression)
@@ -1061,9 +1171,10 @@ func (m *Multiplexer) registerInternalResume(accountID, threadID string) *intern
 	return suppression
 }
 
-func (m *Multiplexer) suppressInternalResumeNotification(accountID, threadID, method string) bool {
+func (m *Multiplexer) suppressInternalResumeNotification(accountID, threadID, method string, raw []byte) bool {
 	switch method {
-	case "thread/started", "thread/tokenUsage/updated", "thread/status/changed", "thread/settings/updated":
+	case "thread/started", "thread/tokenUsage/updated", "thread/status/changed", "thread/settings/updated",
+		"model/rerouted", "warning", "error":
 	default:
 		return false
 	}
@@ -1075,6 +1186,9 @@ func (m *Multiplexer) suppressInternalResumeNotification(accountID, threadID, me
 		return false
 	}
 	suppression := queue[0]
+	if suppression.capture {
+		suppression.captured = append(suppression.captured, append([]byte(nil), raw...))
+	}
 	if method == "thread/started" && !suppression.startedSeen {
 		suppression.startedSeen = true
 		close(suppression.started)
@@ -1083,7 +1197,10 @@ func (m *Multiplexer) suppressInternalResumeNotification(accountID, threadID, me
 	return true
 }
 
-func (m *Multiplexer) finishInternalResume(suppression *internalResumeSuppression) {
+func (m *Multiplexer) finishInternalResume(suppression *internalResumeSuppression) [][]byte {
+	if suppression == nil {
+		return nil
+	}
 	select {
 	case <-suppression.started:
 		// The response and its bootstrap notifications are adjacent on the
@@ -1106,7 +1223,19 @@ func (m *Multiplexer) finishInternalResume(suppression *internalResumeSuppressio
 		}
 		break
 	}
+	captured := append([][]byte(nil), suppression.captured...)
 	m.internalResumeMu.Unlock()
+	return captured
+}
+
+func (m *Multiplexer) replayCapturedNotifications(accountID string, captured [][]byte) {
+	for _, raw := range captured {
+		message, err := protocol.Parse(raw)
+		if err != nil {
+			continue
+		}
+		m.handleInbound(backend.Inbound{AccountID: accountID, Message: message, Raw: raw})
+	}
 }
 
 func (m *Multiplexer) write(message protocol.Message) {
@@ -1330,19 +1459,28 @@ func (m *Multiplexer) watchChild(accountID string, child *backend.Child) {
 
 func (m *Multiplexer) failExternalRoutes(accountID, reason string) {
 	type failedRoute struct {
-		id     json.RawMessage
-		method string
+		id                   json.RawMessage
+		method               string
+		unsubscribeAccountID string
+		unsubscribeThreadID  string
 	}
 	failed := make([]failedRoute, 0)
 	m.externalMu.Lock()
 	for key, route := range m.externalRoutes {
 		if route.accountID == accountID {
-			failed = append(failed, failedRoute{id: route.message.ID, method: route.method})
+			failed = append(failed, failedRoute{
+				id: route.message.ID, method: route.method,
+				unsubscribeAccountID: route.unsubscribeAccountID,
+				unsubscribeThreadID:  route.unsubscribeThreadID,
+			})
 			delete(m.externalRoutes, key)
 		}
 	}
 	m.externalMu.Unlock()
 	for _, route := range failed {
+		if route.unsubscribeAccountID != "" && route.unsubscribeThreadID != "" {
+			go m.unsubscribeThreadOnAccount(route.unsubscribeAccountID, route.unsubscribeThreadID)
+		}
 		m.write(protocol.Failure(route.id, -32032, fmt.Sprintf("%s: %s", route.method, reason)))
 	}
 }

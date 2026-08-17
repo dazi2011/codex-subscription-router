@@ -112,8 +112,9 @@ not mean the patched desktop has completed a new signed-app E2E run.
 - **64 — snapshot request volume.** Periodic renderer polling was removed and
   child RPCs are concurrent. A fresh routing decision still needs current
   account and rate-limit data.
-- **70 — Controller semantics.** Global RPCs still need one Controller, but a
-  disabled Primary no longer remains the effective Controller.
+- **70 — Controller semantics.** Server-generated global identities require a
+  stable Controller. The designated Primary therefore cannot be disabled or
+  implicitly replaced by a Secondary.
 - **88 — failure-path coverage.** Focused tests now cover model matching,
   structured quota classification, owner compare-and-swap/reconciliation,
   model persistence, account removal, unchanged-config mtime, real TOML

@@ -17,6 +17,8 @@ import (
 	"github.com/b-nnett/codex-subscription-router/internal/protocol"
 )
 
+const maxChildJSONMessageBytes = 256 * 1024 * 1024
+
 type Inbound struct {
 	AccountID string
 	Message   protocol.Message
@@ -165,7 +167,7 @@ func (c *Child) Kill() error {
 
 func (c *Child) readLoop(stdout io.Reader) {
 	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 64*1024), 64*1024*1024)
+	scanner.Buffer(make([]byte, 64*1024), maxChildJSONMessageBytes)
 	for scanner.Scan() {
 		raw := append([]byte(nil), scanner.Bytes()...)
 		message, err := protocol.Parse(raw)
@@ -190,6 +192,10 @@ func (c *Child) readLoop(stdout io.Reader) {
 	}
 	if err := scanner.Err(); err != nil {
 		fmt.Fprintf(os.Stderr, "codex-mux: read %s app-server: %v\n", c.accountID, err)
+		// Scanner errors (notably ErrTooLong) permanently stop stdout
+		// consumption while the child process can remain alive. Kill the child so
+		// waitLoop closes pending requests and the multiplexer can restart it.
+		_ = c.Kill()
 	}
 }
 

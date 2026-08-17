@@ -224,7 +224,7 @@ func TestSyncManagedConfigPropagatesPluginsWithoutRestart(t *testing.T) {
 	}
 }
 
-func TestUpdateAccountPreservesController(t *testing.T) {
+func TestControllerCannotBeDisabledOrReassignedImplicitly(t *testing.T) {
 	root := t.TempDir()
 	store, err := Open(root, filepath.Join(root, "primary"))
 	if err != nil {
@@ -236,16 +236,12 @@ func TestUpdateAccountPreservesController(t *testing.T) {
 	}
 	label := "Personal"
 	enabled := false
-	account, err := store.UpdateAccount("primary", &label, &enabled)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if account.Label != label || account.Enabled || !account.Controller {
-		t.Fatalf("unexpected updated account: %#v", account)
+	if _, err := store.UpdateAccount("primary", &label, &enabled); err == nil {
+		t.Fatal("Controller was allowed to become disabled")
 	}
 	controller, ok := store.Controller()
-	if !ok || controller.ID != secondary.ID {
-		t.Fatalf("enabled Secondary did not become the effective Controller: %#v ok=%v", controller, ok)
+	if !ok || controller.ID != "primary" || !controller.Enabled || controller.ID == secondary.ID {
+		t.Fatalf("Controller identity drifted to a Secondary: %#v ok=%v", controller, ok)
 	}
 }
 
@@ -269,6 +265,19 @@ func TestThreadSectionAffinityCanBeLearnedClearedAndCopied(t *testing.T) {
 	}
 	if !store.ControllerAffinedThread("fork") {
 		t.Fatal("fork did not inherit Controller affinity")
+	}
+	if err := store.SetThreadOwner("fork", "primary"); err != nil {
+		t.Fatal(err)
+	}
+	model := "daybreak-blue"
+	if err := store.UpdateThreadCapability("fork", ThreadCapabilityUpdate{Model: &model}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteThreadMetadata("fork"); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := store.ThreadOwner("fork"); exists || store.ControllerAffinedThread("fork") {
+		t.Fatal("failed fork metadata compensation was incomplete")
 	}
 	if err := store.SetThreadSectionAffinity("source", false); err != nil {
 		t.Fatal(err)

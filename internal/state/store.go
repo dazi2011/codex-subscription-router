@@ -211,12 +211,7 @@ func (s *Store) Controller() (Account, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, account := range s.accounts {
-		if account.Controller && account.Enabled {
-			return account, true
-		}
-	}
-	for _, account := range s.accounts {
-		if account.Enabled {
+		if account.Controller {
 			return account, true
 		}
 	}
@@ -345,6 +340,9 @@ func (s *Store) UpdateAccount(id string, label *string, enabled *bool) (Account,
 	for index := range s.accounts {
 		if s.accounts[index].ID != id {
 			continue
+		}
+		if enabled != nil && !*enabled && s.accounts[index].Controller {
+			return Account{}, errors.New("the Controller subscription cannot be disabled")
 		}
 		previous := s.accounts[index]
 		if label != nil {
@@ -541,6 +539,41 @@ func (s *Store) CopyControllerAffinity(sourceThreadID, targetThreadID string) er
 		} else {
 			s.controllerReasons[targetThreadID] = previous
 		}
+		return err
+	}
+	return nil
+}
+
+func (s *Store) DeleteThreadMetadata(threadID string) error {
+	if threadID == "" {
+		return errors.New("thread ID is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, hasOwner := s.owners[threadID]
+	_, hasModel := s.models[threadID]
+	_, hasEffort := s.efforts[threadID]
+	_, hasServiceTier := s.serviceTiers[threadID]
+	_, hasAffinity := s.controllerReasons[threadID]
+	if !hasOwner && !hasModel && !hasEffort && !hasServiceTier && !hasAffinity {
+		return nil
+	}
+	previousOwners := mapsClone(s.owners)
+	previousModels := mapsClone(s.models)
+	previousEfforts := mapsClone(s.efforts)
+	previousServiceTiers := mapsClone(s.serviceTiers)
+	previousControllerReasons := uint8MapsClone(s.controllerReasons)
+	delete(s.owners, threadID)
+	delete(s.models, threadID)
+	delete(s.efforts, threadID)
+	delete(s.serviceTiers, threadID)
+	delete(s.controllerReasons, threadID)
+	if err := s.saveLocked(); err != nil {
+		s.owners = previousOwners
+		s.models = previousModels
+		s.efforts = previousEfforts
+		s.serviceTiers = previousServiceTiers
+		s.controllerReasons = previousControllerReasons
 		return err
 	}
 	return nil

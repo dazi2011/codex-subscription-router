@@ -277,6 +277,17 @@ func TestModelRequirementReadsConfigOverridesWithExplicitFieldsWinning(t *testin
 	}
 }
 
+func TestThreadSettingsUpdateUsesCapabilityAwareRouting(t *testing.T) {
+	for _, method := range []string{"thread/resume", "thread/fork", "thread/settings/update"} {
+		if !capabilityAwareThreadOverrideMethod(method) {
+			t.Fatalf("%s bypassed capability-aware routing", method)
+		}
+	}
+	if capabilityAwareThreadOverrideMethod("thread/metadata/update") {
+		t.Fatal("metadata-only update entered capability migration")
+	}
+}
+
 func TestInitializeResponseIsAlwaysControllerAuthoritative(t *testing.T) {
 	result, failed, err := authoritativeInitializeResult([]childInitializeResult{
 		{
@@ -662,6 +673,31 @@ func TestThreadStartLearnsEffectiveResponseInsteadOfRequestedModel(t *testing.T)
 	}
 }
 
+func TestThreadStartReturnsRoutingMetadataPersistenceError(t *testing.T) {
+	root := t.TempDir()
+	storeRoot := filepath.Join(root, "mux")
+	store, err := state.Open(storeRoot, filepath.Join(root, "primary"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(storeRoot); err != nil {
+		t.Fatal(err)
+	}
+	multiplexer := &Multiplexer{store: store}
+	err = multiplexer.learnThreadOwner(externalRoute{
+		method: "thread/start",
+		message: protocol.Message{Params: json.RawMessage(
+			`{"model":"daybreak-blue"}`,
+		)},
+	}, "primary", json.RawMessage(`{"thread":{"id":"thread-1"}}`))
+	if err == nil {
+		t.Fatal("thread/start hid routing metadata persistence failure")
+	}
+	if _, exists := store.ThreadOwner("thread-1"); exists {
+		t.Fatal("failed routing metadata write was not rolled back")
+	}
+}
+
 func TestServerRequestRouteLivesUntilResponseOrChildExit(t *testing.T) {
 	output := &bytes.Buffer{}
 	multiplexer := &Multiplexer{
@@ -733,6 +769,15 @@ func TestServerRequestResolvedUsesForwardedID(t *testing.T) {
 	}
 }
 
+func TestAttestationServerRequestCompletesOnResponse(t *testing.T) {
+	if !serverRequestCompletesOnResponse("attestation/generate") {
+		t.Fatal("attestation route would wait forever for serverRequest/resolved")
+	}
+	if serverRequestCompletesOnResponse("item/commandExecution/requestApproval") {
+		t.Fatal("approval route was classified as response-complete")
+	}
+}
+
 func TestSecondaryThreadScopedNotificationsUseOwner(t *testing.T) {
 	root := t.TempDir()
 	store, err := state.Open(filepath.Join(root, "mux"), filepath.Join(root, "primary"))
@@ -758,13 +803,15 @@ func TestSecondaryThreadScopedNotificationsUseOwner(t *testing.T) {
 
 func TestInternalThreadStartedSuppressionIsSingleUse(t *testing.T) {
 	multiplexer := &Multiplexer{internalResumes: make(map[string][]*internalResumeSuppression)}
-	suppression := multiplexer.registerInternalResume("secondary", "thread-1")
-	if !multiplexer.suppressInternalResumeNotification("secondary", "thread-1", "thread/tokenUsage/updated") ||
-		!multiplexer.suppressInternalResumeNotification("secondary", "thread-1", "thread/started") {
+	suppression := multiplexer.registerInternalResume("secondary", "thread-1", true)
+	if !multiplexer.suppressInternalResumeNotification("secondary", "thread-1", "thread/tokenUsage/updated", []byte(`{"method":"thread/tokenUsage/updated"}`)) ||
+		!multiplexer.suppressInternalResumeNotification("secondary", "thread-1", "thread/started", []byte(`{"method":"thread/started"}`)) {
 		t.Fatal("internal thread/started notification was not consumed")
 	}
-	multiplexer.finishInternalResume(suppression)
-	if multiplexer.suppressInternalResumeNotification("secondary", "thread-1", "thread/started") {
+	if captured := multiplexer.finishInternalResume(suppression); len(captured) != 2 {
+		t.Fatalf("captured bootstrap notifications = %d, want 2", len(captured))
+	}
+	if multiplexer.suppressInternalResumeNotification("secondary", "thread-1", "thread/started", nil) {
 		t.Fatal("one suppression consumed more than one notification")
 	}
 }
@@ -786,13 +833,14 @@ func TestThreadListRouterCursorPreservesPageSize(t *testing.T) {
 		t.Fatal(err)
 	}
 	var firstResult struct {
-		Data       []map[string]any `json:"data"`
-		NextCursor *string          `json:"nextCursor"`
+		Data            []map[string]any `json:"data"`
+		NextCursor      *string          `json:"nextCursor"`
+		BackwardsCursor *string          `json:"backwardsCursor"`
 	}
 	if err := json.Unmarshal(first.Result, &firstResult); err != nil {
 		t.Fatal(err)
 	}
-	if len(firstResult.Data) != 2 || firstResult.NextCursor == nil {
+	if len(firstResult.Data) != 2 || firstResult.NextCursor == nil || firstResult.BackwardsCursor == nil {
 		t.Fatalf("first page ignored limit/cursor: %s", first.Result)
 	}
 	output.Reset()
@@ -803,14 +851,35 @@ func TestThreadListRouterCursorPreservesPageSize(t *testing.T) {
 		t.Fatal(err)
 	}
 	var secondResult struct {
-		Data       []map[string]any `json:"data"`
-		NextCursor *string          `json:"nextCursor"`
+		Data            []map[string]any `json:"data"`
+		NextCursor      *string          `json:"nextCursor"`
+		BackwardsCursor *string          `json:"backwardsCursor"`
 	}
 	if err := json.Unmarshal(second.Result, &secondResult); err != nil {
 		t.Fatal(err)
 	}
-	if len(secondResult.Data) != 1 || anyString(secondResult.Data[0]["id"]) != "C" || secondResult.NextCursor != nil {
+	if len(secondResult.Data) != 1 || anyString(secondResult.Data[0]["id"]) != "C" ||
+		secondResult.NextCursor != nil || secondResult.BackwardsCursor == nil {
 		t.Fatalf("second page was not resumed from Router cursor: %s", second.Result)
+	}
+	output.Reset()
+	backwardsParams, _ := json.Marshal(map[string]any{
+		"cursor": *secondResult.BackwardsCursor, "sortDirection": "asc",
+	})
+	multiplexer.aggregateThreadList(protocol.Message{ID: json.RawMessage(`3`), Params: backwardsParams})
+	backwards, err := protocol.Parse(bytes.TrimSpace(output.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var backwardsResult struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(backwards.Result, &backwardsResult); err != nil {
+		t.Fatal(err)
+	}
+	if len(backwardsResult.Data) != 2 || anyString(backwardsResult.Data[0]["id"]) != "B" ||
+		anyString(backwardsResult.Data[1]["id"]) != "A" {
+		t.Fatalf("backwards cursor did not reverse from the page anchor: %s", backwards.Result)
 	}
 }
 
