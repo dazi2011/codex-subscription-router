@@ -64,6 +64,25 @@ func TestRateLimitsRequireEveryAdvertisedWindowToHaveCapacity(t *testing.T) {
 	}
 }
 
+func TestQuotaCapacityDistinguishesUnknownFromExhausted(t *testing.T) {
+	if state := rateLimitsCapacityState(nil); state != quotaCapacityUnknown {
+		t.Fatalf("nil quota = %v, want UNKNOWN", state)
+	}
+	if state := rateLimitsCapacityState(&RateLimits{}); state != quotaCapacityUnknown {
+		t.Fatalf("empty quota = %v, want UNKNOWN", state)
+	}
+	if state := rateLimitsCapacityState(&RateLimits{
+		Primary: &RateLimitWindow{UsedPercent: 25},
+	}); state != quotaCapacityAvailable {
+		t.Fatalf("available quota = %v", state)
+	}
+	if state := rateLimitsCapacityState(&RateLimits{
+		Primary: &RateLimitWindow{UsedPercent: 100},
+	}); state != quotaCapacityExhausted {
+		t.Fatalf("exhausted quota = %v", state)
+	}
+}
+
 func TestDataBoundarySeparatesOrganizationsAndPersonalPlans(t *testing.T) {
 	personal := AccountSnapshot{PlanType: "plus", WorkspaceID: "personal-a"}
 	personalPro := AccountSnapshot{PlanType: "pro", WorkspaceID: "personal-b"}
@@ -134,6 +153,25 @@ func TestAggregateRateLimitsReportsAllDepleted(t *testing.T) {
 	}
 	if limits.RateLimitReachedType != "rate_limit_reached" {
 		t.Fatalf("expected the pool to report depletion, got %#v", limits)
+	}
+}
+
+func TestAggregateRateLimitsDoesNotTurnUnknownIntoDepleted(t *testing.T) {
+	limits, err := aggregateRateLimits([]AccountSnapshot{
+		{
+			ID: "known-exhausted", Enabled: true, Connected: true, AuthType: "chatgpt", PlanType: "plus",
+			RateLimits: &RateLimits{Primary: &RateLimitWindow{UsedPercent: 100}},
+		},
+		{
+			ID: "temporarily-unknown", Enabled: true, Connected: true, AuthType: "chatgpt", PlanType: "plus",
+			RateLimits: nil,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if limits.RateLimitReachedType != nil {
+		t.Fatalf("UNKNOWN quota was reported as pool depletion: %#v", limits)
 	}
 }
 

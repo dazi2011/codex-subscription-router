@@ -33,6 +33,7 @@ type persistedState struct {
 	ThreadModel       map[string]string `json:"threadModel,omitempty"`
 	ThreadEffort      map[string]string `json:"threadEffort,omitempty"`
 	ThreadServiceTier map[string]string `json:"threadServiceTier,omitempty"`
+	ControllerThreads map[string]bool   `json:"controllerThreads,omitempty"`
 }
 
 type ThreadCapability struct {
@@ -55,18 +56,19 @@ type ThreadCapabilityUpdate struct {
 // Store persists only routing metadata. OAuth credentials and conversation
 // databases remain inside each account's isolated Codex home.
 type Store struct {
-	mu               sync.RWMutex
-	root             string
-	path             string
-	primaryCodexHome string
-	accounts         []Account
-	owners           map[string]string
-	models           map[string]string
-	efforts          map[string]string
-	serviceTiers     map[string]string
-	configMu         sync.Mutex
-	managedConfigSum [sha256.Size]byte
-	hasManagedSum    bool
+	mu                sync.RWMutex
+	root              string
+	path              string
+	primaryCodexHome  string
+	accounts          []Account
+	owners            map[string]string
+	models            map[string]string
+	efforts           map[string]string
+	serviceTiers      map[string]string
+	controllerThreads map[string]bool
+	configMu          sync.Mutex
+	managedConfigSum  [sha256.Size]byte
+	hasManagedSum     bool
 }
 
 func Open(root, primaryCodexHome string) (*Store, error) {
@@ -81,13 +83,14 @@ func Open(root, primaryCodexHome string) (*Store, error) {
 	}
 
 	store := &Store{
-		root:             root,
-		path:             filepath.Join(root, "state.json"),
-		primaryCodexHome: primaryCodexHome,
-		owners:           make(map[string]string),
-		models:           make(map[string]string),
-		efforts:          make(map[string]string),
-		serviceTiers:     make(map[string]string),
+		root:              root,
+		path:              filepath.Join(root, "state.json"),
+		primaryCodexHome:  primaryCodexHome,
+		owners:            make(map[string]string),
+		models:            make(map[string]string),
+		efforts:           make(map[string]string),
+		serviceTiers:      make(map[string]string),
+		controllerThreads: make(map[string]bool),
 	}
 	data, err := os.ReadFile(store.path)
 	switch {
@@ -111,6 +114,9 @@ func Open(root, primaryCodexHome string) (*Store, error) {
 		}
 		if persisted.ThreadServiceTier != nil {
 			store.serviceTiers = persisted.ThreadServiceTier
+		}
+		if persisted.ControllerThreads != nil {
+			store.controllerThreads = persisted.ControllerThreads
 		}
 	case errors.Is(err, os.ErrNotExist):
 		store.accounts = []Account{{
@@ -273,11 +279,13 @@ func (s *Store) RemoveAccount(id string) (Account, error) {
 	previousModels := s.models
 	previousEfforts := s.efforts
 	previousServiceTiers := s.serviceTiers
+	previousControllerThreads := s.controllerThreads
 	s.accounts = append(slices.Clone(s.accounts[:index]), s.accounts[index+1:]...)
 	s.owners = make(map[string]string, len(previousOwners))
 	s.models = make(map[string]string, len(previousModels))
 	s.efforts = make(map[string]string, len(previousEfforts))
 	s.serviceTiers = make(map[string]string, len(previousServiceTiers))
+	s.controllerThreads = make(map[string]bool, len(previousControllerThreads))
 	for threadID, accountID := range previousOwners {
 		if accountID != id {
 			s.owners[threadID] = accountID
@@ -298,12 +306,18 @@ func (s *Store) RemoveAccount(id string) (Account, error) {
 			s.serviceTiers[threadID] = serviceTier
 		}
 	}
+	for threadID, controllerAffined := range previousControllerThreads {
+		if _, exists := s.owners[threadID]; exists && controllerAffined {
+			s.controllerThreads[threadID] = true
+		}
+	}
 	if err := s.saveLocked(); err != nil {
 		s.accounts = previousAccounts
 		s.owners = previousOwners
 		s.models = previousModels
 		s.efforts = previousEfforts
 		s.serviceTiers = previousServiceTiers
+		s.controllerThreads = previousControllerThreads
 		return Account{}, err
 	}
 	if err := os.RemoveAll(accountRoot); err != nil {
@@ -435,6 +449,31 @@ func (s *Store) ThreadCapability(threadID string) ThreadCapability {
 	}
 }
 
+// ControllerAffinedThread records that a thread references a server-generated
+// identity which only exists in the Controller's state database.
+func (s *Store) ControllerAffinedThread(threadID string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.controllerThreads[threadID]
+}
+
+func (s *Store) SetControllerAffinedThread(threadID string) error {
+	if threadID == "" {
+		return errors.New("thread ID is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.controllerThreads[threadID] {
+		return nil
+	}
+	s.controllerThreads[threadID] = true
+	if err := s.saveLocked(); err != nil {
+		delete(s.controllerThreads, threadID)
+		return err
+	}
+	return nil
+}
+
 // UpdateThreadCapability applies a three-state capability update. A nil field
 // leaves the existing value unchanged; a non-nil empty value records an
 // explicit clear/default.
@@ -534,6 +573,7 @@ func (s *Store) saveLocked() error {
 		ThreadModel:       s.models,
 		ThreadEffort:      s.efforts,
 		ThreadServiceTier: s.serviceTiers,
+		ControllerThreads: s.controllerThreads,
 	}
 	data, err := json.MarshalIndent(persisted, "", "  ")
 	if err != nil {

@@ -36,6 +36,9 @@ func TestStoreBootstrapsPrimaryAndPersistsThreadAffinity(t *testing.T) {
 	if err := store.SetThreadOwner("thread-1", added.ID); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.SetControllerAffinedThread("thread-1"); err != nil {
+		t.Fatal(err)
+	}
 	model, effort, serviceTier := "daybreak-blue", "xhigh", "priority"
 	if err := store.UpdateThreadCapability("thread-1", ThreadCapabilityUpdate{
 		Model: &model, Effort: &effort, ServiceTier: &serviceTier,
@@ -57,6 +60,9 @@ func TestStoreBootstrapsPrimaryAndPersistsThreadAffinity(t *testing.T) {
 	if capability := reopened.ThreadCapability("thread-1"); !capability.ModelKnown || !capability.EffortKnown || !capability.ServiceTierKnown ||
 		capability.Effort != "xhigh" || capability.ServiceTier != "priority" {
 		t.Fatalf("thread sub-capabilities were not persisted: %#v", capability)
+	}
+	if !reopened.ControllerAffinedThread("thread-1") {
+		t.Fatal("Controller-local thread affinity was not persisted")
 	}
 	cleared := ""
 	if err := reopened.UpdateThreadCapability("thread-1", ThreadCapabilityUpdate{ServiceTier: &cleared}); err != nil {

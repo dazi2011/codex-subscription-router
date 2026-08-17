@@ -38,6 +38,14 @@ type RateLimits struct {
 	RateLimitReachedType any              `json:"rateLimitReachedType"`
 }
 
+type quotaCapacityState uint8
+
+const (
+	quotaCapacityUnknown quotaCapacityState = iota
+	quotaCapacityAvailable
+	quotaCapacityExhausted
+)
+
 type AccountSnapshot struct {
 	ID              string          `json:"id"`
 	Label           string          `json:"label"`
@@ -368,7 +376,7 @@ func (m *Multiplexer) chooseAccountForRequirementExcluding(
 			continue
 		}
 		weekly, short := longestAndShortestWindow(snapshot.RateLimits)
-		if !rateLimitsHaveCapacity(snapshot.RateLimits) {
+		if accountQuotaState(snapshot) == quotaCapacityExhausted {
 			continue
 		}
 		weeklyUsed := 1_000.0
@@ -501,6 +509,7 @@ func aggregateRateLimits(snapshots []AccountSnapshot) (*RateLimits, error) {
 	secondary := make([]*RateLimitWindow, 0, len(snapshots))
 	hasSubscription := false
 	hasCapacity := false
+	hasUnknownCapacity := false
 	planType := ""
 	hasPlanType := false
 	for _, snapshot := range snapshots {
@@ -518,8 +527,11 @@ func aggregateRateLimits(snapshots []AccountSnapshot) (*RateLimits, error) {
 			primary = append(primary, snapshot.RateLimits.Primary)
 			secondary = append(secondary, snapshot.RateLimits.Secondary)
 		}
-		if rateLimitsHaveCapacity(snapshot.RateLimits) {
+		switch accountQuotaState(snapshot) {
+		case quotaCapacityAvailable:
 			hasCapacity = true
+		case quotaCapacityUnknown:
+			hasUnknownCapacity = true
 		}
 	}
 	if !hasSubscription {
@@ -529,15 +541,22 @@ func aggregateRateLimits(snapshots []AccountSnapshot) (*RateLimits, error) {
 		Primary:   averageRateLimitWindow(primary),
 		Secondary: averageRateLimitWindow(secondary),
 	}
-	if !hasCapacity {
+	if !hasCapacity && !hasUnknownCapacity {
 		result.RateLimitReachedType = "rate_limit_reached"
 	}
 	return result, nil
 }
 
 func rateLimitsHaveCapacity(limits *RateLimits) bool {
-	if limits == nil || limits.RateLimitReachedType != nil {
-		return false
+	return rateLimitsCapacityState(limits) == quotaCapacityAvailable
+}
+
+func rateLimitsCapacityState(limits *RateLimits) quotaCapacityState {
+	if limits == nil {
+		return quotaCapacityUnknown
+	}
+	if limits.RateLimitReachedType != nil {
+		return quotaCapacityExhausted
 	}
 	hasWindow := false
 	for _, window := range []*RateLimitWindow{limits.Primary, limits.Secondary} {
@@ -546,10 +565,24 @@ func rateLimitsHaveCapacity(limits *RateLimits) bool {
 		}
 		hasWindow = true
 		if window.UsedPercent >= 100 {
-			return false
+			return quotaCapacityExhausted
 		}
 	}
-	return hasWindow
+	if !hasWindow {
+		return quotaCapacityUnknown
+	}
+	return quotaCapacityAvailable
+}
+
+func accountEligibleForRouting(snapshot AccountSnapshot) bool {
+	return snapshot.Enabled && snapshot.Connected && snapshot.AuthType == "chatgpt"
+}
+
+func accountQuotaState(snapshot AccountSnapshot) quotaCapacityState {
+	if !accountEligibleForRouting(snapshot) {
+		return quotaCapacityExhausted
+	}
+	return rateLimitsCapacityState(snapshot.RateLimits)
 }
 
 func sameDataBoundary(source, target AccountSnapshot) bool {

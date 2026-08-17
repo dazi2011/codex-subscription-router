@@ -3,6 +3,7 @@ package mux
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -81,6 +82,105 @@ func TestModelRequirementUsesCurrentTurnAndCollaborationOverrides(t *testing.T) 
 	}
 }
 
+func TestModelRequirementReadsConfigOverridesWithExplicitFieldsWinning(t *testing.T) {
+	configOnly := modelRequirementFromParams(json.RawMessage(`{
+		"config":{"model":"daybreak-blue","model_reasoning_effort":"xhigh"}
+	}`))
+	if configOnly.Model != "daybreak-blue" || configOnly.Effort != "xhigh" ||
+		!configOnly.ModelKnown || !configOnly.EffortKnown {
+		t.Fatalf("config capability override was ignored: %#v", configOnly)
+	}
+	explicit := modelRequirementFromParams(json.RawMessage(`{
+		"config":{"model":"config-model","model_reasoning_effort":"high"},
+		"model":"explicit-model","effort":"medium"
+	}`))
+	if explicit.Model != "explicit-model" || explicit.Effort != "medium" {
+		t.Fatalf("explicit app-server fields did not override config defaults: %#v", explicit)
+	}
+}
+
+func TestInitializeResponseIsAlwaysControllerAuthoritative(t *testing.T) {
+	result, failed, err := authoritativeInitializeResult([]childInitializeResult{
+		{
+			accountID: "secondary", response: protocol.Message{
+				Result: json.RawMessage(`{"codexHome":"/secondary"}`),
+			},
+		},
+		{
+			accountID: "primary", controller: true, response: protocol.Message{
+				Result: json.RawMessage(`{"codexHome":"/primary"}`),
+			},
+		},
+	})
+	if err != nil || len(failed) != 0 || string(result) != `{"codexHome":"/primary"}` {
+		t.Fatalf("secondary won initialize race: result=%s failed=%v err=%v", result, failed, err)
+	}
+	_, _, err = authoritativeInitializeResult([]childInitializeResult{
+		{accountID: "secondary", response: protocol.Message{Result: json.RawMessage(`{}`)}},
+		{accountID: "primary", controller: true, err: errors.New("not initialized")},
+	})
+	if err == nil {
+		t.Fatal("secondary success masked Controller initialize failure")
+	}
+}
+
+func TestGlobalStateRoutingClassifiesGeneratedAndReplicatedState(t *testing.T) {
+	for _, method := range []string{
+		"project/create", "project/list", "threadSection/create", "threadSection/list",
+		"environment/status", "experimentalFeature/list",
+	} {
+		if !controllerGlobalStateMethod(method) {
+			t.Fatalf("%s was not Controller-affined", method)
+		}
+	}
+	for _, method := range []string{
+		"environment/add", "skills/extraRoots/set", "experimentalFeature/enablement/set",
+		"thread/loaded/list", "thread/start",
+	} {
+		if controllerGlobalStateMethod(method) {
+			t.Fatalf("%s was incorrectly forced through the generic Controller path", method)
+		}
+	}
+	if !threadStartUsesControllerState(json.RawMessage(`{"projectId":"project-1"}`)) ||
+		!threadStartUsesControllerState(json.RawMessage(`{"sectionId":"section-1"}`)) ||
+		threadStartUsesControllerState(json.RawMessage(`{"projectId":null}`)) {
+		t.Fatal("thread/start Controller-state affinity was not detected precisely")
+	}
+}
+
+func TestProcessGlobalMutationStateSurvivesChildRestartReplay(t *testing.T) {
+	multiplexer := &Multiplexer{globalMutations: make(map[string]globalMutation)}
+	multiplexer.rememberGlobalMutation("experimentalFeature/enablement/set", json.RawMessage(`{
+		"enablement":{"alpha":true}
+	}`))
+	multiplexer.rememberGlobalMutation("experimentalFeature/enablement/set", json.RawMessage(`{
+		"enablement":{"beta":false}
+	}`))
+	multiplexer.rememberGlobalMutation("environment/add", json.RawMessage(`{
+		"environmentId":"env-1","execServerUrl":"wss://one"
+	}`))
+	multiplexer.rememberGlobalMutation("environment/add", json.RawMessage(`{
+		"environmentId":"env-2","execServerUrl":"wss://two"
+	}`))
+	multiplexer.rememberGlobalMutation("skills/extraRoots/set", json.RawMessage(`{"extraRoots":["/old"]}`))
+	multiplexer.rememberGlobalMutation("skills/extraRoots/set", json.RawMessage(`{"extraRoots":["/current"]}`))
+	if len(multiplexer.globalOrder) != 4 || len(multiplexer.globalMutations) != 4 {
+		t.Fatalf("unexpected replay state: order=%v mutations=%#v", multiplexer.globalOrder, multiplexer.globalMutations)
+	}
+	feature := multiplexer.globalMutations["experimentalFeature/enablement/set"]
+	var featureParams map[string]any
+	if err := json.Unmarshal(feature.params, &featureParams); err != nil {
+		t.Fatal(err)
+	}
+	enablement, _ := featureParams["enablement"].(map[string]any)
+	if enablement["alpha"] != true || enablement["beta"] != false {
+		t.Fatalf("incremental feature settings were not merged: %s", feature.params)
+	}
+	if got := string(multiplexer.globalMutations["skills/extraRoots/set"].params); got != `{"extraRoots":["/current"]}` {
+		t.Fatalf("replace-style global state retained a stale value: %s", got)
+	}
+}
+
 func TestFailoverParamsCarryStickyModelSubCapabilities(t *testing.T) {
 	params := paramsWithModelRequirement(
 		json.RawMessage(`{"threadId":"thread-1","input":[]}`),
@@ -96,6 +196,76 @@ func TestFailoverParamsCarryStickyModelSubCapabilities(t *testing.T) {
 	}
 	if threadIDFromParams(params) != "thread-1" {
 		t.Fatalf("failover parameter rewrite lost thread identity: %s", params)
+	}
+}
+
+func TestCrossAccountResumeAndForkCarryEffectiveCapabilityOverrides(t *testing.T) {
+	info := threadResumeInfo{
+		ID: "thread-1", Path: "/tmp/thread.jsonl", CWD: "/tmp/project", ModelProvider: "openai",
+	}
+	requirement := modelRequirement{
+		Model: "daybreak-blue", ModelKnown: true,
+		Effort: "xhigh", EffortKnown: true,
+		ServiceTier: "priority", ServiceTierKnown: true,
+	}
+	for _, method := range []string{"thread/resume", "thread/fork"} {
+		params, err := crossAccountThreadParams(method, json.RawMessage(`{
+			"threadId":"thread-1","excludeTurns":true,"config":{"unrelated":"preserved"}
+		}`), info, requirement)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var decoded map[string]any
+		if err := json.Unmarshal(params, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		config, _ := decoded["config"].(map[string]any)
+		if decoded["path"] != "/tmp/thread.jsonl" || decoded["cwd"] != "/tmp/project" ||
+			decoded["model"] != "daybreak-blue" || decoded["serviceTier"] != "priority" ||
+			config["model"] != "daybreak-blue" || config["model_reasoning_effort"] != "xhigh" ||
+			config["unrelated"] != "preserved" || decoded["excludeTurns"] != true {
+			t.Fatalf("%s lost cross-account overrides: %s", method, params)
+		}
+		_, historyPresent := decoded["history"]
+		if historyPresent != (method == "thread/resume") {
+			t.Fatalf("%s encoded an invalid history field: %s", method, params)
+		}
+	}
+}
+
+func TestThreadSortingHonorsRequestedKeyDirectionAndSectionOrder(t *testing.T) {
+	original := []map[string]any{
+		{"id": "C", "createdAt": float64(3), "updatedAt": float64(1), "recencyAt": float64(2)},
+		{"id": "A", "createdAt": float64(1), "updatedAt": float64(3), "recencyAt": nil},
+		{"id": "B", "createdAt": float64(2), "updatedAt": float64(2), "recencyAt": float64(1)},
+	}
+	tests := []struct {
+		params string
+		want   string
+	}{
+		{`{"sortKey":"created_at","sortDirection":"asc"}`, "ABC"},
+		{`{"sortKey":"updated_at","sortDirection":"desc"}`, "ABC"},
+		{`{"sortKey":"recency_at","sortDirection":"asc"}`, "ABC"},
+		{`{}`, "CBA"},
+		{`{"sortKey":"section_position","sortDirection":"asc"}`, "CAB"},
+	}
+	for _, test := range tests {
+		threads := make([]map[string]any, len(original))
+		for index, thread := range original {
+			copy := make(map[string]any, len(thread))
+			for key, value := range thread {
+				copy[key] = value
+			}
+			threads[index] = copy
+		}
+		sortThreads(threads, json.RawMessage(test.params))
+		got := ""
+		for _, thread := range threads {
+			got += anyString(thread["id"])
+		}
+		if got != test.want {
+			t.Fatalf("sort %s = %s, want %s", test.params, got, test.want)
+		}
 	}
 }
 

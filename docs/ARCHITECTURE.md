@@ -22,6 +22,11 @@ remaining divided by the hours until that account resets. Banked usage resets
 add a capped bonus, while short-window usage, existing pinned-thread count, and
 stable account order break close results. Reset-credit metadata is fetched in
 parallel, cached for five minutes, and treated as neutral when unavailable.
+Quota observations have three states: available, exhausted, and unknown. A
+temporary `account/rateLimits/read` failure keeps the current healthy owner and
+does not make the pool appear depleted. New routing prefers accounts with
+known available quota, then may use an unknown account rather than falsely
+claiming every subscription is exhausted.
 Once a thread ID is known, `state.json` persists its owner. Requests, responses,
 approvals, and notifications are rewritten only as needed to preserve one
 coherent desktop session.
@@ -44,7 +49,11 @@ leave stored state unchanged; explicit `null` values record a cleared/default
 setting. Before a failover, the source process is resumed/rejoined without
 overrides so historical pre-router threads can recover their effective model
 without relying on a nonexistent `Thread.model` field. Explicit settings on
-the current turn then override those source settings.
+the current turn then override those source settings. Capability parsing also
+honors `config.model` and `config.model_reasoning_effort`. Model overrides on
+`thread/resume` and `thread/fork` are checked against the current owner; when
+that owner is definitively incompatible, a compatible same-boundary child uses
+the shared rollout path and its effective response becomes authoritative.
 
 A successful failover uses the target resume response as the effective model
 baseline and injects the resulting values into the first target turn so the
@@ -66,7 +75,21 @@ external side effects. Threads do not migrate for ordinary load balancing.
 protocol supports search, working-directory, archive, source, and ancestry
 filters. The router merges newly observed ownership without pruning unseen
 metadata; this also prevents a stale listing from deleting a thread created
-while the listing was in flight.
+while the listing was in flight. Timestamp results are merged using the
+requested `sortKey` and `sortDirection`; `section_position` keeps the
+app-server's order because that opaque position is not exposed on `Thread`.
+
+The Controller is authoritative for server-generated global identities such
+as projects and thread sections. Threads that reference such identities are
+persistently Controller-affined, and a cross-process section reference is
+rejected instead of being sent to a database that cannot resolve it. Global
+mutations with client-defined identity or idempotent desired state—currently
+`environment/add`, `skills/extraRoots/set`, and
+`experimentalFeature/enablement/set`—must succeed on every enabled child before
+the Controller response is returned. Their desired runtime values are replayed
+after a child is started and initialized, so a child restart does not recreate
+split-brain state. `thread/loaded/list` is the de-duplicated union of all live
+children.
 
 Child exit removes that process from the live map, fails outstanding desktop
 RPCs, drops its outstanding server-request routes, and restarts the child while
@@ -76,7 +99,8 @@ or the owning child/connection exits. The 30-second control timeout is limited
 to router-owned metadata and diagnostic calls, so a long `command/exec`, MCP
 elicitation, or human approval is not converted into a false timeout while the
 real operation continues. Initialization fans out concurrently under one
-control timeout.
+control timeout, but only the Controller response is returned as the logical
+server identity; a Secondary success cannot mask Controller failure.
 
 ## Account isolation
 

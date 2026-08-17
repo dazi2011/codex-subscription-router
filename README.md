@@ -36,6 +36,9 @@ binaries or a prebuilt application.
 - **Long-lived approvals and commands.** Proxied RPCs are tied to their actual
   response or child connection, so the router does not cancel a human approval
   or a still-running command after 30 seconds.
+- **Controller-consistent global state.** Server-generated project and section
+  identities remain Controller-affined, while safe process-wide settings are
+  synchronized across enabled children before success is reported.
 - **Native account management.** The existing profile menu shows pooled usage,
   profile photos, plan names, masked emails, and device-code sign-in.
 - **Account-aware settings.** Profile statistics can be viewed together or per
@@ -211,8 +214,12 @@ starts another sign-in.
 | Follow-up | Sent to the thread's persisted account owner |
 | Either owner quota window depleted | Continued only through a capability- and data-boundary-compatible account |
 | Existing thread changes model/tier | Owner capability is rechecked; a compatible legacy thread can move |
+| Resume/fork supplies model config overrides | `config.model` and reasoning effort are checked before routing; a compatible same-boundary child uses the shared rollout path |
 | Historical thread lacks router model metadata | Effective settings are recovered lazily from its source app-server before failover |
 | Settings update or server model reroute | Effective capability state is updated from the corresponding notification |
+| Quota read temporarily fails | Treated as unknown, not depleted; the current healthy owner stays in place |
+| Project or thread-section identity is referenced | Kept on the Controller; cross-process section references fail explicitly instead of corrupting state |
+| Thread list requests a sort order | Timestamp keys honor the requested direction; section order is preserved |
 | Approval or command exceeds 30 seconds | Remains pending until its real response or child exit |
 | Paginated thread needs failover | Rejected explicitly; no verified cross-process writer-release RPC exists |
 | Post-submit quota error | Original error returned without replaying side effects |

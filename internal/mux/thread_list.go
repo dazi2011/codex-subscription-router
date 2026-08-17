@@ -12,7 +12,11 @@ import (
 func (m *Multiplexer) aggregateThreadList(request protocol.Message) {
 	ctx, cancel := context.WithTimeout(context.Background(), controlRequestTimeout)
 	defer cancel()
-	entries := m.childEntries()
+	entries := m.threadListEntries(request.Params)
+	if len(entries) == 0 {
+		m.write(protocol.Failure(request.ID, -32034, "controller history is unavailable for the requested section"))
+		return
+	}
 	type result struct {
 		index     int
 		accountID string
@@ -89,13 +93,31 @@ func (m *Multiplexer) aggregateThreadList(request protocol.Message) {
 		m.write(protocol.Failure(request.ID, -32603, fmt.Sprintf("persist merged thread list: %v", err)))
 		return
 	}
-	sortThreads(threads)
+	sortThreads(threads, request.Params)
 	encoded, err := json.Marshal(map[string]any{"data": threads, "nextCursor": nil})
 	if err != nil {
 		m.write(protocol.Failure(request.ID, -32603, "failed to merge thread list"))
 		return
 	}
 	m.write(protocol.Success(request.ID, encoded))
+}
+
+func (m *Multiplexer) threadListEntries(params json.RawMessage) []childEntry {
+	entries := m.childEntries()
+	var decoded map[string]any
+	if json.Unmarshal(params, &decoded) != nil {
+		return entries
+	}
+	sectionID, present := decoded["sectionId"]
+	if !present || sectionID == nil || anyString(sectionID) == "" {
+		return entries
+	}
+	for _, entry := range entries {
+		if entry.account.Controller {
+			return []childEntry{entry}
+		}
+	}
+	return nil
 }
 
 func (m *Multiplexer) listAllThreads(parent context.Context, entry childEntry, originalParams json.RawMessage) ([]map[string]any, error) {

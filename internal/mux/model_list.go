@@ -263,14 +263,23 @@ func modelRequirementFromParams(params json.RawMessage) modelRequirement {
 	if json.Unmarshal(params, &decoded) != nil {
 		return modelRequirement{}
 	}
+	requirement := modelRequirement{}
+	if config, ok := decoded["config"].(map[string]any); ok {
+		model, modelKnown := capabilityField(config, "model")
+		effort, effortKnown := capabilityField(config, "model_reasoning_effort")
+		requirement = modelRequirement{
+			Model: model, ModelKnown: modelKnown,
+			Effort: effort, EffortKnown: effortKnown,
+		}
+	}
 	model, modelKnown := capabilityField(decoded, "model")
 	effort, effortKnown := capabilityField(decoded, "effort")
 	serviceTier, serviceTierKnown := capabilityField(decoded, "serviceTier")
-	requirement := modelRequirement{
+	requirement = requirement.overlay(modelRequirement{
 		Model: model, ModelKnown: modelKnown,
 		Effort: effort, EffortKnown: effortKnown,
 		ServiceTier: serviceTier, ServiceTierKnown: serviceTierKnown,
-	}
+	})
 	if collaboration, ok := decoded["collaborationMode"].(map[string]any); ok {
 		if settings, ok := collaboration["settings"].(map[string]any); ok {
 			if model, known := capabilityField(settings, "model"); known {

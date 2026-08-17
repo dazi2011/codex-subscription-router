@@ -44,6 +44,13 @@ type serverRequestRoute struct {
 	original  json.RawMessage
 }
 
+type childInitializeResult struct {
+	accountID  string
+	controller bool
+	response   protocol.Message
+	err        error
+}
+
 type Event struct {
 	Type      string `json:"type"`
 	AccountID string `json:"accountId,omitempty"`
@@ -69,6 +76,10 @@ type Multiplexer struct {
 	initializationMu sync.RWMutex
 	initializeParams json.RawMessage
 	initialized      bool
+	globalApplyMu    sync.Mutex
+	globalStateMu    sync.RWMutex
+	globalMutations  map[string]globalMutation
+	globalOrder      []string
 
 	externalMu     sync.Mutex
 	externalRoutes map[string]externalRoute
@@ -113,6 +124,7 @@ func New(options Options) (*Multiplexer, error) {
 		inbound:              make(chan backend.Inbound, 1024),
 		externalRoutes:       make(map[string]externalRoute),
 		serverRoutes:         make(map[string]serverRequestRoute),
+		globalMutations:      make(map[string]globalMutation),
 		events:               make(map[chan Event]struct{}),
 		profileClient:        &http.Client{Timeout: 10 * time.Second},
 		profileCache:         make(map[string]profileCacheEntry),
@@ -175,16 +187,24 @@ func (m *Multiplexer) HandleClient(message protocol.Message) {
 		m.handleClientNotification(message)
 		return
 	}
+	if controllerGlobalStateMethod(message.Method) {
+		m.routeControllerRequest(message)
+		return
+	}
 
 	switch message.Method {
 	case "thread/list":
 		go m.aggregateThreadList(message)
+	case "thread/loaded/list":
+		go m.aggregateLoadedThreadList(message)
 	case "model/list":
 		go m.aggregateModelList(message)
 	case "thread/start":
 		go m.routeNewThread(message)
 	case "account/rateLimits/read":
 		go m.routeAggregatedRateLimits(message)
+	case "environment/add", "skills/extraRoots/set", "experimentalFeature/enablement/set":
+		go m.broadcastGlobalMutation(message)
 	default:
 		m.routeExistingRequest(message)
 	}
@@ -195,39 +215,64 @@ func (m *Multiplexer) initialize(message protocol.Message) {
 	m.initializeParams = append(json.RawMessage(nil), message.Params...)
 	m.initializationMu.Unlock()
 
-	type result struct {
-		response protocol.Message
-		err      error
-	}
 	entries := m.childEntries()
-	results := make(chan result, len(entries))
+	results := make(chan childInitializeResult, len(entries))
 	ctx, cancel := context.WithTimeout(context.Background(), controlRequestTimeout)
 	defer cancel()
 	for _, entry := range entries {
 		go func(entry childEntry) {
 			response, err := entry.child.Request(ctx, "initialize", message.Params)
-			results <- result{response: response, err: err}
+			results <- childInitializeResult{
+				accountID: entry.account.ID, controller: entry.account.Controller,
+				response: response, err: err,
+			}
 		}(entry)
 	}
-	var firstResult json.RawMessage
-	var firstErr error
+	completed := make([]childInitializeResult, 0, len(entries))
 	for range entries {
-		result := <-results
-		if result.err != nil {
-			if firstErr == nil {
-				firstErr = result.err
-			}
-			continue
-		}
-		if firstResult == nil {
-			firstResult = result.response.Result
-		}
+		completed = append(completed, <-results)
 	}
-	if firstResult == nil {
-		m.write(protocol.Failure(message.ID, -32000, fmt.Sprintf("failed to initialize account pool: %v", firstErr)))
+	controllerResult, failedSecondaries, err := authoritativeInitializeResult(completed)
+	if err != nil {
+		m.write(protocol.Failure(message.ID, -32000, err.Error()))
 		return
 	}
-	m.write(protocol.Success(message.ID, firstResult))
+	if len(failedSecondaries) > 0 {
+		m.publish(Event{
+			Type:    "initialize-partial",
+			Message: "Some secondary app-servers failed to initialize",
+			Data:    map[string]any{"failedAccountIds": failedSecondaries},
+		})
+		for _, accountID := range failedSecondaries {
+			go func(accountID string) {
+				stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer stopCancel()
+				_ = m.stopChild(stopCtx, accountID)
+			}(accountID)
+		}
+	}
+	m.write(protocol.Success(message.ID, controllerResult))
+}
+
+func authoritativeInitializeResult(results []childInitializeResult) (json.RawMessage, []string, error) {
+	failedSecondaries := make([]string, 0)
+	var controller *childInitializeResult
+	for index := range results {
+		result := results[index]
+		if result.controller {
+			copy := result
+			controller = &copy
+		} else if result.err != nil {
+			failedSecondaries = append(failedSecondaries, result.accountID)
+		}
+	}
+	if controller == nil {
+		return nil, failedSecondaries, errors.New("failed to initialize account pool: controller app-server is unavailable")
+	}
+	if controller.err != nil {
+		return nil, failedSecondaries, fmt.Errorf("failed to initialize controller app-server: %v", controller.err)
+	}
+	return controller.response.Result, failedSecondaries, nil
 }
 
 func (m *Multiplexer) handleClientNotification(message protocol.Message) {
@@ -248,6 +293,10 @@ func (m *Multiplexer) handleClientNotification(message protocol.Message) {
 func (m *Multiplexer) routeNewThread(message protocol.Message) {
 	ctx, cancel := context.WithTimeout(context.Background(), controlRequestTimeout)
 	defer cancel()
+	if threadStartUsesControllerState(message.Params) {
+		m.routeControllerAffinedThread(ctx, message)
+		return
+	}
 	account, reason, err := m.chooseAccountForRequirement(ctx, modelRequirementFromParams(message.Params))
 	if err != nil {
 		if errors.Is(err, errNoSubscriptionCapacity) {
@@ -293,8 +342,19 @@ func (m *Multiplexer) routeExistingRequest(message protocol.Message) {
 		m.write(protocol.Failure(message.ID, -32022, "no controller account is configured"))
 		return
 	}
+	if message.Method == "thread/section/move" {
+		if err := m.validateThreadSectionMove(message.Params, accountID); err != nil {
+			m.write(protocol.Failure(message.ID, -32036, err.Error()))
+			return
+		}
+	}
 	if message.Method == "turn/start" && threadID != "" {
 		go m.routeTurnStart(message, threadID, accountID)
+		return
+	}
+	if (message.Method == "thread/resume" || message.Method == "thread/fork") &&
+		threadID != "" && !modelRequirementFromParams(message.Params).empty() {
+		go m.routeThreadCapabilityOverride(message, threadID, accountID)
 		return
 	}
 	if err := m.forward(accountID, message); err != nil {
@@ -359,7 +419,8 @@ func (m *Multiplexer) routeTurnStart(message protocol.Message, threadID, ownerID
 	snapshot, err := m.accountSnapshotWithProfile(ctx, ownerID, false)
 	requested := modelRequirementFromParams(message.Params)
 	effective := storedModelRequirement(m.store.ThreadCapability(threadID)).overlay(requested)
-	if err == nil && accountHasCapacity(snapshot) {
+	if err == nil && accountEligibleForRouting(snapshot) &&
+		accountQuotaState(snapshot) != quotaCapacityExhausted {
 		if requested.empty() {
 			if err := m.forward(ownerID, message); err != nil {
 				m.write(protocol.Failure(message.ID, -32023, err.Error()))
@@ -375,6 +436,11 @@ func (m *Multiplexer) routeTurnStart(message protocol.Message, threadID, ownerID
 			}
 			return
 		}
+	}
+	if m.store.ControllerAffinedThread(threadID) {
+		m.write(protocol.Failure(message.ID, -32035,
+			"this chat references Controller-local state and cannot fail over to a different app-server process"))
+		return
 	}
 	excluded := map[string]struct{}{ownerID: {}}
 	var source *AccountSnapshot
@@ -755,6 +821,10 @@ func (m *Multiplexer) learnThreadOwner(route externalRoute, accountID string, re
 			if info, err := threadResumeInfoFromResponse(result); err == nil {
 				_ = m.store.UpdateThreadCapability(threadID, stateCapabilityUpdate(info.Capability))
 			}
+			if (route.method == "thread/start" && threadStartUsesControllerState(route.message.Params)) ||
+				(route.method == "thread/fork" && m.store.ControllerAffinedThread(threadIDFromParams(route.message.Params))) {
+				_ = m.store.SetControllerAffinedThread(threadID)
+			}
 		}
 	case "thread/unarchive":
 		if threadID := threadIDFromResult(result); threadID != "" {
@@ -763,6 +833,14 @@ func (m *Multiplexer) learnThreadOwner(route externalRoute, accountID string, re
 	case "turn/start", "thread/settings/update":
 		if threadID := threadIDFromParams(route.message.Params); threadID != "" {
 			_ = m.store.SetThreadOwner(threadID, accountID)
+		}
+	case "thread/section/move":
+		if threadID := threadIDFromParams(route.message.Params); threadID != "" {
+			_ = m.store.SetThreadOwner(threadID, accountID)
+			var params map[string]any
+			if json.Unmarshal(route.message.Params, &params) == nil && params["sectionId"] != nil {
+				_ = m.store.SetControllerAffinedThread(threadID)
+			}
 		}
 	}
 }
@@ -897,29 +975,42 @@ func (m *Multiplexer) startChild(ctx context.Context, account state.Account) (*b
 		_, err := child.Request(requestCtx, "initialize", params)
 		cancel()
 		if err != nil {
-			m.childrenMu.Lock()
-			if m.children[account.ID] == child {
-				delete(m.children, account.ID)
-			}
-			m.childrenMu.Unlock()
-			_ = child.Close()
-			select {
-			case <-child.Done():
-			case <-time.After(2 * time.Second):
-				_ = child.Kill()
-				select {
-				case <-child.Done():
-				case <-time.After(2 * time.Second):
-				}
-			}
+			m.discardUnreadyChild(account.ID, child)
 			return nil, err
 		}
 		if initialized {
 			_ = child.Send(protocol.Message{Method: "initialized"})
+			m.globalApplyMu.Lock()
+			replayErr := m.replayGlobalMutations(ctx, child)
+			m.globalApplyMu.Unlock()
+			if replayErr != nil {
+				m.discardUnreadyChild(account.ID, child)
+				return nil, fmt.Errorf("restore process-wide state: %w", replayErr)
+			}
 		}
 	}
 	go m.watchChild(account.ID, child)
 	return child, nil
+}
+
+func (m *Multiplexer) discardUnreadyChild(accountID string, child *backend.Child) {
+	m.childrenMu.Lock()
+	if m.children[accountID] == child {
+		delete(m.children, accountID)
+	}
+	m.childrenMu.Unlock()
+	m.failExternalRoutes(accountID, "Codex app-server failed to initialize")
+	m.dropServerRoutes(accountID)
+	_ = child.Close()
+	select {
+	case <-child.Done():
+	case <-time.After(2 * time.Second):
+		_ = child.Kill()
+		select {
+		case <-child.Done():
+		case <-time.After(2 * time.Second):
+		}
+	}
 }
 
 func (m *Multiplexer) ensureChild(ctx context.Context, accountID string) (*backend.Child, error) {
@@ -1095,13 +1186,6 @@ func threadIDFromNotification(params json.RawMessage) string {
 	return threadIDFromResult(params)
 }
 
-func accountHasCapacity(snapshot AccountSnapshot) bool {
-	if !snapshot.Enabled || !snapshot.Connected || snapshot.AuthType != "chatgpt" {
-		return false
-	}
-	return rateLimitsHaveCapacity(snapshot.RateLimits)
-}
-
 func isUsageLimitResponse(message protocol.Message) bool {
 	if message.Error == nil {
 		return false
@@ -1183,17 +1267,56 @@ func allSubscriptionsDepleted(id json.RawMessage, resetsAt *int64) protocol.Mess
 	)
 }
 
-func sortThreads(threads []map[string]any) {
+func sortThreads(threads []map[string]any, params json.RawMessage) {
+	sortKey := "created_at"
+	sortDirection := "desc"
+	var decoded map[string]any
+	if json.Unmarshal(params, &decoded) == nil {
+		if value := anyString(decoded["sortKey"]); value != "" {
+			sortKey = value
+		}
+		if value := anyString(decoded["sortDirection"]); value != "" {
+			sortDirection = value
+		}
+	}
+	field := ""
+	switch sortKey {
+	case "created_at":
+		field = "createdAt"
+	case "updated_at":
+		field = "updatedAt"
+	case "recency_at":
+		field = "recencyAt"
+	case "section_position":
+		// Position is intentionally not exposed on Thread. Each child already
+		// returned the authoritative order, so a timestamp re-sort would corrupt
+		// it. Concrete section queries are Controller-only.
+		return
+	default:
+		return
+	}
 	sort.SliceStable(threads, func(i, j int) bool {
-		return numericField(threads[i], "updatedAt", "createdAt") > numericField(threads[j], "updatedAt", "createdAt")
+		left, leftKnown := numericField(threads[i], field)
+		right, rightKnown := numericField(threads[j], field)
+		if leftKnown != rightKnown {
+			if sortDirection == "asc" {
+				return !leftKnown
+			}
+			return leftKnown
+		}
+		if !leftKnown || left == right {
+			return false
+		}
+		if sortDirection == "asc" {
+			return left < right
+		}
+		return left > right
 	})
 }
 
-func numericField(value map[string]any, keys ...string) float64 {
-	for _, key := range keys {
-		if number, ok := value[key].(float64); ok {
-			return number
-		}
+func numericField(value map[string]any, key string) (float64, bool) {
+	if number, ok := value[key].(float64); ok {
+		return number, true
 	}
-	return 0
+	return 0, false
 }

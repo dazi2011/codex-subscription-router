@@ -1,0 +1,388 @@
+package mux
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/b-nnett/codex-subscription-router/internal/backend"
+	"github.com/b-nnett/codex-subscription-router/internal/protocol"
+)
+
+type globalMutation struct {
+	method string
+	params json.RawMessage
+}
+
+// Server-generated global identities stay in the Controller's state database.
+// Methods with thread-scoped state are deliberately excluded from this list.
+func controllerGlobalStateMethod(method string) bool {
+	return strings.HasPrefix(method, "project/") ||
+		strings.HasPrefix(method, "threadSection/") ||
+		method == "environment/info" ||
+		method == "environment/status" ||
+		method == "experimentalFeature/list"
+}
+
+func (m *Multiplexer) routeControllerRequest(message protocol.Message) {
+	controller, ok := m.store.Controller()
+	if !ok {
+		m.write(protocol.Failure(message.ID, -32022, "no controller account is configured"))
+		return
+	}
+	if err := m.forward(controller.ID, message); err != nil {
+		m.write(protocol.Failure(message.ID, -32023, err.Error()))
+	}
+}
+
+// These mutations are safe to replicate because their identity and desired
+// value come from the client. Apply them to secondaries first, then return the
+// Controller's authoritative response only after every child accepted them.
+func (m *Multiplexer) broadcastGlobalMutation(message protocol.Message) {
+	accounts := m.store.Accounts()
+	type target struct {
+		accountID  string
+		controller bool
+		child      *backend.Child
+		err        error
+	}
+	enabled := make([]target, 0, len(accounts))
+	for _, account := range accounts {
+		if !account.Enabled {
+			continue
+		}
+		enabled = append(enabled, target{accountID: account.ID, controller: account.Controller})
+	}
+	if len(enabled) == 0 {
+		m.write(protocol.Failure(message.ID, -32022, "no controller account is configured"))
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), controlRequestTimeout)
+	defer cancel()
+	ensured := make(chan target, len(enabled))
+	for _, candidate := range enabled {
+		go func(candidate target) {
+			candidate.child, candidate.err = m.ensureChild(ctx, candidate.accountID)
+			ensured <- candidate
+		}(candidate)
+	}
+	secondaries := make([]target, 0, len(enabled))
+	var controller *backend.Child
+	failed := make([]string, 0)
+	var firstErr error
+	for range enabled {
+		candidate := <-ensured
+		if candidate.err != nil {
+			failed = append(failed, candidate.accountID)
+			if firstErr == nil {
+				firstErr = candidate.err
+			}
+			continue
+		}
+		if candidate.controller {
+			controller = candidate.child
+		} else {
+			secondaries = append(secondaries, candidate)
+		}
+	}
+	if controller == nil {
+		if firstErr == nil {
+			firstErr = errors.New("controller app-server is unavailable")
+		}
+		m.write(protocol.Failure(message.ID, -32037, fmt.Sprintf("cannot synchronize %s: %v", message.Method, firstErr)))
+		return
+	}
+	if len(failed) > 0 {
+		m.write(protocol.Failure(message.ID, -32037, fmt.Sprintf(
+			"%s was not applied because enabled app-servers are unavailable (%s): %v",
+			message.Method, strings.Join(failed, ", "), firstErr,
+		)))
+		return
+	}
+
+	m.globalApplyMu.Lock()
+	defer m.globalApplyMu.Unlock()
+	type result struct {
+		accountID string
+		err       error
+	}
+	results := make(chan result, len(secondaries))
+	for _, candidate := range secondaries {
+		go func(candidate target) {
+			_, err := candidate.child.Request(ctx, message.Method, message.Params)
+			results <- result{accountID: candidate.accountID, err: err}
+		}(candidate)
+	}
+	failed = failed[:0]
+	firstErr = nil
+	for range secondaries {
+		result := <-results
+		if result.err != nil {
+			failed = append(failed, result.accountID)
+			if firstErr == nil {
+				firstErr = result.err
+			}
+		}
+	}
+	if len(failed) > 0 {
+		m.publish(Event{
+			Type:    "global-state-sync-failed",
+			Message: "A process-wide app-server setting was not accepted by every secondary",
+			Data: map[string]any{
+				"method": message.Method, "failedAccountIds": failed,
+			},
+		})
+		m.write(protocol.Failure(message.ID, -32037, fmt.Sprintf(
+			"%s was not applied to every app-server; Controller was left unchanged: %v",
+			message.Method, firstErr,
+		)))
+		return
+	}
+
+	response, err := controller.Request(ctx, message.Method, message.Params)
+	if err == nil {
+		m.rememberGlobalMutation(message.Method, message.Params)
+		m.write(protocol.Success(message.ID, response.Result))
+		return
+	}
+	m.publish(Event{
+		Type:    "global-state-sync-failed",
+		Message: "Controller rejected a process-wide app-server setting after secondary synchronization",
+		Data:    map[string]any{"method": message.Method},
+	})
+	m.write(protocol.Failure(message.ID, -32037, fmt.Sprintf("Controller %s failed: %v", message.Method, err)))
+}
+
+func (m *Multiplexer) rememberGlobalMutation(method string, params json.RawMessage) {
+	key := globalMutationKey(method, params)
+	m.globalStateMu.Lock()
+	defer m.globalStateMu.Unlock()
+	if m.globalMutations == nil {
+		m.globalMutations = make(map[string]globalMutation)
+	}
+	if method == "experimentalFeature/enablement/set" {
+		if previous, exists := m.globalMutations[key]; exists {
+			params = mergeFeatureEnablement(previous.params, params)
+		}
+	}
+	if _, exists := m.globalMutations[key]; !exists {
+		m.globalOrder = append(m.globalOrder, key)
+	}
+	m.globalMutations[key] = globalMutation{
+		method: method, params: append(json.RawMessage(nil), params...),
+	}
+}
+
+func globalMutationKey(method string, params json.RawMessage) string {
+	if method != "environment/add" {
+		return method
+	}
+	var decoded map[string]any
+	if json.Unmarshal(params, &decoded) == nil {
+		if environmentID := anyString(decoded["environmentId"]); environmentID != "" {
+			return method + ":" + environmentID
+		}
+	}
+	return method
+}
+
+func mergeFeatureEnablement(previous, update json.RawMessage) json.RawMessage {
+	var oldParams, newParams map[string]any
+	if json.Unmarshal(previous, &oldParams) != nil || json.Unmarshal(update, &newParams) != nil {
+		return update
+	}
+	oldEnablement, oldOK := oldParams["enablement"].(map[string]any)
+	newEnablement, newOK := newParams["enablement"].(map[string]any)
+	if !oldOK || !newOK {
+		return update
+	}
+	for feature, enabled := range newEnablement {
+		oldEnablement[feature] = enabled
+	}
+	encoded, err := json.Marshal(map[string]any{"enablement": oldEnablement})
+	if err != nil {
+		return update
+	}
+	return encoded
+}
+
+func (m *Multiplexer) replayGlobalMutations(parent context.Context, child *backend.Child) error {
+	m.globalStateMu.RLock()
+	mutations := make([]globalMutation, 0, len(m.globalOrder))
+	for _, key := range m.globalOrder {
+		mutation := m.globalMutations[key]
+		mutation.params = append(json.RawMessage(nil), mutation.params...)
+		mutations = append(mutations, mutation)
+	}
+	m.globalStateMu.RUnlock()
+	for _, mutation := range mutations {
+		ctx, cancel := context.WithTimeout(parent, controlRequestTimeout)
+		_, err := child.Request(ctx, mutation.method, mutation.params)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("%s: %w", mutation.method, err)
+		}
+	}
+	return nil
+}
+
+func threadStartUsesControllerState(params json.RawMessage) bool {
+	var decoded map[string]any
+	if json.Unmarshal(params, &decoded) != nil {
+		return false
+	}
+	for _, key := range []string{"projectId", "project_id", "sectionId", "section_id"} {
+		if value, present := decoded[key]; present && value != nil && anyString(value) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Multiplexer) routeControllerAffinedThread(ctx context.Context, message protocol.Message) {
+	controller, ok := m.store.Controller()
+	if !ok {
+		m.write(protocol.Failure(message.ID, -32022, "no controller account is configured"))
+		return
+	}
+	requirement := modelRequirementFromParams(message.Params)
+	if snapshot, err := m.accountSnapshotWithProfile(ctx, controller.ID, false); err == nil {
+		if accountQuotaState(snapshot) == quotaCapacityExhausted {
+			m.write(protocol.Failure(message.ID, -32035,
+				"Controller-local project or section state cannot be routed to another subscription while the Controller is depleted"))
+			return
+		}
+		if requirement.Model != "" {
+			supported, capabilityErr := m.accountSupportsRequirement(ctx, snapshot, requirement)
+			if capabilityErr == nil && !supported {
+				m.write(protocol.Failure(message.ID, -32035, fmt.Sprintf(
+					"Controller-local project or section state requires the Controller, but it does not support %s",
+					requirementDescription(requirement),
+				)))
+				return
+			}
+		}
+	}
+	if err := m.forward(controller.ID, message); err != nil {
+		m.write(protocol.Failure(message.ID, -32023, err.Error()))
+		return
+	}
+	m.publish(Event{
+		Type:      "thread-routed",
+		AccountID: controller.ID,
+		Message:   "New chat pinned to the Controller because it references Controller-local state",
+	})
+}
+
+func (m *Multiplexer) validateThreadSectionMove(params json.RawMessage, ownerID string) error {
+	var decoded map[string]any
+	if json.Unmarshal(params, &decoded) != nil {
+		return nil
+	}
+	controller, ok := m.store.Controller()
+	if !ok {
+		return errors.New("no controller account is configured")
+	}
+	if sectionID, present := decoded["sectionId"]; present && sectionID != nil && anyString(sectionID) != "" && ownerID != controller.ID {
+		return errors.New("thread sections are stored by the Controller; a Secondary-owned thread cannot reference a Controller section")
+	}
+	if beforeThreadID := anyString(decoded["beforeThreadId"]); beforeThreadID != "" {
+		if beforeOwner, known := m.store.ThreadOwner(beforeThreadID); known && beforeOwner != ownerID {
+			return errors.New("threads owned by different app-server processes cannot share one section ordering")
+		}
+	}
+	return nil
+}
+
+func (m *Multiplexer) aggregateLoadedThreadList(message protocol.Message) {
+	entries := m.childEntries()
+	if len(entries) == 0 {
+		m.write(protocol.Failure(message.ID, -32038, "no connected app-server can list loaded threads"))
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), controlRequestTimeout)
+	defer cancel()
+	type result struct {
+		index     int
+		accountID string
+		threadIDs []string
+		err       error
+	}
+	results := make(chan result, len(entries))
+	for index, entry := range entries {
+		go func(index int, entry childEntry) {
+			threadIDs, err := listAllLoadedThreads(ctx, entry, message.Params)
+			results <- result{index: index, accountID: entry.account.ID, threadIDs: threadIDs, err: err}
+		}(index, entry)
+	}
+	ordered := make([]result, len(entries))
+	for range entries {
+		result := <-results
+		if result.err != nil {
+			m.write(protocol.Failure(message.ID, -32038, fmt.Sprintf(
+				"subscription %s loaded-thread state is unavailable: %v", result.accountID, result.err,
+			)))
+			return
+		}
+		ordered[result.index] = result
+	}
+	seen := make(map[string]struct{})
+	threadIDs := make([]string, 0)
+	for _, result := range ordered {
+		for _, threadID := range result.threadIDs {
+			if _, exists := seen[threadID]; exists {
+				continue
+			}
+			seen[threadID] = struct{}{}
+			threadIDs = append(threadIDs, threadID)
+		}
+	}
+	encoded, err := json.Marshal(map[string]any{"data": threadIDs, "nextCursor": nil})
+	if err != nil {
+		m.write(protocol.Failure(message.ID, -32603, "failed to merge loaded thread list"))
+		return
+	}
+	m.write(protocol.Success(message.ID, encoded))
+}
+
+func listAllLoadedThreads(parent context.Context, entry childEntry, originalParams json.RawMessage) ([]string, error) {
+	var params map[string]any
+	if json.Unmarshal(originalParams, &params) != nil {
+		params = make(map[string]any)
+	}
+	params["limit"] = 500
+	threadIDs := make([]string, 0)
+	seenCursors := make(map[string]struct{})
+	var cursor string
+	for {
+		if cursor == "" {
+			params["cursor"] = nil
+		} else {
+			params["cursor"] = cursor
+		}
+		encodedParams, _ := json.Marshal(params)
+		response, err := entry.child.Request(parent, "thread/loaded/list", encodedParams)
+		if err != nil {
+			return nil, err
+		}
+		var decoded struct {
+			Data       []string `json:"data"`
+			NextCursor *string  `json:"nextCursor"`
+		}
+		if err := json.Unmarshal(response.Result, &decoded); err != nil {
+			return nil, fmt.Errorf("decode loaded thread list: %w", err)
+		}
+		threadIDs = append(threadIDs, decoded.Data...)
+		if decoded.NextCursor == nil || *decoded.NextCursor == "" {
+			return threadIDs, nil
+		}
+		cursor = *decoded.NextCursor
+		if _, repeated := seenCursors[cursor]; repeated {
+			return nil, fmt.Errorf("loaded thread list repeated cursor %q", cursor)
+		}
+		seenCursors[cursor] = struct{}{}
+	}
+}

@@ -62,8 +62,9 @@ not mean the patched desktop has completed a new signed-app E2E run.
 - **71–78 — enabled, healthy, and quota-unknown state.** Controller selection
   skips disabled accounts, disabling stops the child, startup skips disabled
   accounts, snapshots expose process/RPC health separately from login state,
-  missing quota is not treated as capacity, and exhaustion in either advertised
-  short or long window makes the account unavailable.
+  missing quota remains an unknown observation rather than fabricated
+  exhaustion, and exhaustion in either advertised short or long window makes
+  the account unavailable. Known capacity is preferred over unknown capacity.
 
 - **Follow-up model/catalog findings.** One failed secondary `model/list` now
   produces a partial union instead of failing the whole selector. Duplicate
@@ -76,6 +77,13 @@ not mean the patched desktop has completed a new signed-app E2E run.
   persistence distinguishes omission from explicit `null`. Historical threads
   recover effective settings lazily from a source-account resume before target
   selection, rather than reading a nonexistent model field from `Thread`.
+- **Follow-up global-state findings.** The Controller initialize response is
+  authoritative. Server-generated project and section identities stay
+  Controller-affined; safe client-identified process mutations are synchronized
+  across enabled children, and loaded-thread state is aggregated. Thread-list
+  merging honors the requested timestamp sort and preserves opaque section
+  order. `config.model`/reasoning overrides and resume/fork overrides now enter
+  capability-aware routing.
 
 ## Mitigated, not transactional or independently verified
 
