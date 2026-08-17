@@ -10,7 +10,7 @@ import (
 )
 
 func (m *Multiplexer) aggregateThreadList(request protocol.Message) {
-	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), controlRequestTimeout)
 	defer cancel()
 	entries := m.childEntries()
 	type result struct {
@@ -64,7 +64,6 @@ func (m *Multiplexer) aggregateThreadList(request protocol.Message) {
 
 	threads := make([]map[string]any, 0, len(order)+len(anonymous))
 	owners := make(map[string]string, len(order))
-	models := make(map[string]string, len(order))
 	for _, threadID := range order {
 		candidates := byID[threadID]
 		selected := candidates[0]
@@ -84,12 +83,9 @@ func (m *Multiplexer) aggregateThreadList(request protocol.Message) {
 		} else {
 			owners[threadID] = selected.accountID
 		}
-		if model, _ := selected.thread["model"].(string); model != "" {
-			models[threadID] = model
-		}
 	}
 	threads = append(threads, anonymous...)
-	if err := m.store.MergeThreadMetadata(owners, models); err != nil {
+	if err := m.store.MergeThreadMetadata(owners, nil); err != nil {
 		m.write(protocol.Failure(request.ID, -32603, fmt.Sprintf("persist merged thread list: %v", err)))
 		return
 	}
@@ -118,7 +114,7 @@ func (m *Multiplexer) listAllThreads(parent context.Context, entry childEntry, o
 			params["cursor"] = cursor
 		}
 		encodedParams, _ := json.Marshal(params)
-		ctx, cancel := context.WithTimeout(parent, requestTimeout)
+		ctx, cancel := context.WithTimeout(parent, controlRequestTimeout)
 		response, err := entry.child.Request(ctx, "thread/list", encodedParams)
 		cancel()
 		if err != nil {

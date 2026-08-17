@@ -16,24 +16,30 @@ var (
 )
 
 type modelRequirement struct {
-	Model       string
-	Effort      string
-	ServiceTier string
+	Model            string
+	ModelKnown       bool
+	Effort           string
+	EffortKnown      bool
+	ServiceTier      string
+	ServiceTierKnown bool
 }
 
 func (requirement modelRequirement) empty() bool {
-	return requirement.Model == "" && requirement.Effort == "" && requirement.ServiceTier == ""
+	return !requirement.ModelKnown && !requirement.EffortKnown && !requirement.ServiceTierKnown
 }
 
 func (requirement modelRequirement) overlay(override modelRequirement) modelRequirement {
-	if override.Model != "" {
+	if override.ModelKnown {
 		requirement.Model = override.Model
+		requirement.ModelKnown = true
 	}
-	if override.Effort != "" {
+	if override.EffortKnown {
 		requirement.Effort = override.Effort
+		requirement.EffortKnown = true
 	}
-	if override.ServiceTier != "" {
+	if override.ServiceTierKnown {
 		requirement.ServiceTier = override.ServiceTier
+		requirement.ServiceTierKnown = true
 	}
 	return requirement
 }
@@ -85,21 +91,36 @@ func (m *Multiplexer) aggregateModelList(request protocol.Message) {
 			Data:    map[string]any{"failedAccountIds": failedAccounts},
 		})
 	}
+	catalogs := make([][]map[string]any, 0, succeeded)
+	for _, result := range ordered {
+		if result.err == nil && result.accountID != "" {
+			catalogs = append(catalogs, result.models)
+		}
+	}
+	merged := mergeModelCatalogs(catalogs)
+	encoded, err := json.Marshal(map[string]any{"data": merged, "nextCursor": nil})
+	if err != nil {
+		m.write(protocol.Failure(request.ID, -32603, "failed to merge model list"))
+		return
+	}
+	m.write(protocol.Success(request.ID, encoded))
+}
+
+func mergeModelCatalogs(catalogs [][]map[string]any) []map[string]any {
 	merged := make([]map[string]any, 0)
 	mergedIndex := make(map[string]int)
 	hasDefault := false
-	for _, result := range ordered {
-		if result.err != nil || result.accountID == "" {
-			continue
-		}
-		for _, model := range result.models {
+	for _, catalog := range catalogs {
+		for _, model := range catalog {
 			key := modelKey(model)
 			if key == "" {
 				encoded, _ := json.Marshal(model)
 				key = string(encoded)
 			}
-			if index, exists := mergedIndex[key]; exists {
-				mergeModelCapabilities(merged[index], model)
+			if _, exists := mergedIndex[key]; exists {
+				// Keep one real account's capability tuple. Independently
+				// unioning effort and tier dimensions invents cross-account
+				// combinations that no single subscription supports.
 				continue
 			}
 			if isDefault, _ := model["isDefault"].(bool); isDefault {
@@ -118,12 +139,7 @@ func (m *Multiplexer) aggregateModelList(request protocol.Message) {
 			merged = append(merged, model)
 		}
 	}
-	encoded, err := json.Marshal(map[string]any{"data": merged, "nextCursor": nil})
-	if err != nil {
-		m.write(protocol.Failure(request.ID, -32603, "failed to merge model list"))
-		return
-	}
-	m.write(protocol.Success(request.ID, encoded))
+	return merged
 }
 
 func (m *Multiplexer) modelCapableAccounts(
@@ -209,7 +225,7 @@ func (m *Multiplexer) listAllModels(parent context.Context, child *backend.Child
 			params["cursor"] = cursor
 		}
 		encodedParams, _ := json.Marshal(params)
-		ctx, cancel := context.WithTimeout(parent, requestTimeout)
+		ctx, cancel := context.WithTimeout(parent, controlRequestTimeout)
 		response, err := child.Request(ctx, "model/list", encodedParams)
 		cancel()
 		if err != nil {
@@ -239,7 +255,7 @@ func modelFromParams(params json.RawMessage) string {
 }
 
 func modelsContain(models []map[string]any, required string) bool {
-	return modelsSupportRequirement(models, modelRequirement{Model: required})
+	return modelsSupportRequirement(models, modelRequirement{Model: required, ModelKnown: true})
 }
 
 func modelRequirementFromParams(params json.RawMessage) modelRequirement {
@@ -247,18 +263,23 @@ func modelRequirementFromParams(params json.RawMessage) modelRequirement {
 	if json.Unmarshal(params, &decoded) != nil {
 		return modelRequirement{}
 	}
+	model, modelKnown := capabilityField(decoded, "model")
+	effort, effortKnown := capabilityField(decoded, "effort")
+	serviceTier, serviceTierKnown := capabilityField(decoded, "serviceTier")
 	requirement := modelRequirement{
-		Model:       anyString(decoded["model"]),
-		Effort:      anyString(decoded["effort"]),
-		ServiceTier: anyString(decoded["serviceTier"]),
+		Model: model, ModelKnown: modelKnown,
+		Effort: effort, EffortKnown: effortKnown,
+		ServiceTier: serviceTier, ServiceTierKnown: serviceTierKnown,
 	}
 	if collaboration, ok := decoded["collaborationMode"].(map[string]any); ok {
 		if settings, ok := collaboration["settings"].(map[string]any); ok {
-			if model := anyString(settings["model"]); model != "" {
+			if model, known := capabilityField(settings, "model"); known {
 				requirement.Model = model
+				requirement.ModelKnown = true
 			}
-			if effort := anyString(settings["reasoning_effort"]); effort != "" {
+			if effort, known := capabilityField(settings, "reasoning_effort"); known {
 				requirement.Effort = effort
+				requirement.EffortKnown = true
 			}
 		}
 	}
@@ -320,69 +341,6 @@ func modelSupportsServiceTier(model map[string]any, serviceTier string) bool {
 	return false
 }
 
-func mergeModelCapabilities(target, source map[string]any) {
-	target["supportedReasoningEfforts"] = mergeObjectArrayByKey(
-		anySlice(target["supportedReasoningEfforts"]),
-		anySlice(source["supportedReasoningEfforts"]),
-		"reasoningEffort",
-	)
-	target["serviceTiers"] = mergeObjectArrayByKey(
-		anySlice(target["serviceTiers"]),
-		anySlice(source["serviceTiers"]),
-		"id",
-	)
-	target["additionalSpeedTiers"] = mergeStringArray(
-		anySlice(target["additionalSpeedTiers"]),
-		anySlice(source["additionalSpeedTiers"]),
-	)
-}
-
-func mergeObjectArrayByKey(target, source []any, key string) []any {
-	merged := append([]any(nil), target...)
-	seen := make(map[string]struct{}, len(target))
-	for _, value := range target {
-		if fields, ok := value.(map[string]any); ok {
-			seen[anyString(fields[key])] = struct{}{}
-		}
-	}
-	for _, value := range source {
-		fields, ok := value.(map[string]any)
-		if !ok {
-			continue
-		}
-		identifier := anyString(fields[key])
-		if identifier == "" {
-			continue
-		}
-		if _, exists := seen[identifier]; exists {
-			continue
-		}
-		seen[identifier] = struct{}{}
-		merged = append(merged, value)
-	}
-	return merged
-}
-
-func mergeStringArray(target, source []any) []any {
-	merged := append([]any(nil), target...)
-	seen := make(map[string]struct{}, len(target))
-	for _, value := range target {
-		seen[anyString(value)] = struct{}{}
-	}
-	for _, value := range source {
-		identifier := anyString(value)
-		if identifier == "" {
-			continue
-		}
-		if _, exists := seen[identifier]; exists {
-			continue
-		}
-		seen[identifier] = struct{}{}
-		merged = append(merged, identifier)
-	}
-	return merged
-}
-
 func anySlice(value any) []any {
 	values, _ := value.([]any)
 	return values
@@ -393,25 +351,41 @@ func anyString(value any) string {
 	return text
 }
 
+func capabilityField(values map[string]any, key string) (string, bool) {
+	value, present := values[key]
+	if !present || value == nil {
+		return "", present
+	}
+	text, _ := value.(string)
+	return text, true
+}
+
 func paramsWithModelRequirement(params json.RawMessage, requirement modelRequirement) json.RawMessage {
 	var decoded map[string]any
 	if json.Unmarshal(params, &decoded) != nil {
 		return params
 	}
-	if requirement.Model != "" {
-		decoded["model"] = requirement.Model
+	if requirement.ModelKnown {
+		decoded["model"] = nullableCapabilityValue(requirement.Model)
 	}
-	if requirement.Effort != "" {
-		decoded["effort"] = requirement.Effort
+	if requirement.EffortKnown {
+		decoded["effort"] = nullableCapabilityValue(requirement.Effort)
 	}
-	if requirement.ServiceTier != "" {
-		decoded["serviceTier"] = requirement.ServiceTier
+	if requirement.ServiceTierKnown {
+		decoded["serviceTier"] = nullableCapabilityValue(requirement.ServiceTier)
 	}
 	encoded, err := json.Marshal(decoded)
 	if err != nil {
 		return params
 	}
 	return encoded
+}
+
+func nullableCapabilityValue(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
 }
 
 func modelKey(model map[string]any) string {

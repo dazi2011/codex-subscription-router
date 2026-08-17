@@ -36,8 +36,9 @@ func TestStoreBootstrapsPrimaryAndPersistsThreadAffinity(t *testing.T) {
 	if err := store.SetThreadOwner("thread-1", added.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdateThreadCapability("thread-1", ThreadCapability{
-		Model: "daybreak-blue", Effort: "xhigh", ServiceTier: "priority",
+	model, effort, serviceTier := "daybreak-blue", "xhigh", "priority"
+	if err := store.UpdateThreadCapability("thread-1", ThreadCapabilityUpdate{
+		Model: &model, Effort: &effort, ServiceTier: &serviceTier,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -53,8 +54,20 @@ func TestStoreBootstrapsPrimaryAndPersistsThreadAffinity(t *testing.T) {
 	if model, ok := reopened.ThreadModel("thread-1"); !ok || model != "daybreak-blue" {
 		t.Fatalf("thread model was not persisted: model=%q ok=%v", model, ok)
 	}
-	if capability := reopened.ThreadCapability("thread-1"); capability.Effort != "xhigh" || capability.ServiceTier != "priority" {
+	if capability := reopened.ThreadCapability("thread-1"); !capability.ModelKnown || !capability.EffortKnown || !capability.ServiceTierKnown ||
+		capability.Effort != "xhigh" || capability.ServiceTier != "priority" {
 		t.Fatalf("thread sub-capabilities were not persisted: %#v", capability)
+	}
+	cleared := ""
+	if err := reopened.UpdateThreadCapability("thread-1", ThreadCapabilityUpdate{ServiceTier: &cleared}); err != nil {
+		t.Fatal(err)
+	}
+	reopenedAgain, err := Open(filepath.Join(root, "mux"), primaryHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if capability := reopenedAgain.ThreadCapability("thread-1"); !capability.ServiceTierKnown || capability.ServiceTier != "" {
+		t.Fatalf("explicit service-tier clear was not persisted: %#v", capability)
 	}
 }
 

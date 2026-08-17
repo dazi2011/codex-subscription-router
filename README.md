@@ -31,7 +31,11 @@ binaries or a prebuilt application.
   and the account data boundary are compatible; otherwise the app shows an
   explicit error.
 - **Multi-account model discovery.** The model selector is the de-duplicated
-  union of enabled subscriptions rather than the Primary account's list.
+  union of enabled subscriptions rather than the Primary account's list;
+  duplicate models retain one real account's correlated capability tuple.
+- **Long-lived approvals and commands.** Proxied RPCs are tied to their actual
+  response or child connection, so the router does not cancel a human approval
+  or a still-running command after 30 seconds.
 - **Native account management.** The existing profile menu shows pooled usage,
   profile photos, plan names, masked emails, and device-code sign-in.
 - **Account-aware settings.** Profile statistics can be viewed together or per
@@ -207,6 +211,9 @@ starts another sign-in.
 | Follow-up | Sent to the thread's persisted account owner |
 | Either owner quota window depleted | Continued only through a capability- and data-boundary-compatible account |
 | Existing thread changes model/tier | Owner capability is rechecked; a compatible legacy thread can move |
+| Historical thread lacks router model metadata | Effective settings are recovered lazily from its source app-server before failover |
+| Settings update or server model reroute | Effective capability state is updated from the corresponding notification |
+| Approval or command exceeds 30 seconds | Remains pending until its real response or child exit |
 | Paginated thread needs failover | Rejected explicitly; no verified cross-process writer-release RPC exists |
 | Post-submit quota error | Original error returned without replaying side effects |
 | Every account depleted | Combined quota alert with the next known reset |
@@ -253,7 +260,7 @@ helper and socket paths and are not relocatable or intended for redistribution.
 | Path | Purpose |
 | --- | --- |
 | `~/.codex` | Primary credentials, conversations, and cache |
-| `~/.codex-mux/state.json` | Account metadata and sticky thread ownership |
+| `~/.codex-mux/state.json` | Account metadata plus sticky thread owner and effective model settings |
 | `~/.codex-mux/accounts/<id>/codex-home` | Isolated secondary account data |
 | `~/.codex-mux/control-token` | Token for the loopback-only control service |
 | `~/.codex-mux/backups` | Recoverable app and helper backups |

@@ -36,9 +36,20 @@ type persistedState struct {
 }
 
 type ThreadCapability struct {
-	Model       string
-	Effort      string
-	ServiceTier string
+	Model            string
+	ModelKnown       bool
+	Effort           string
+	EffortKnown      bool
+	ServiceTier      string
+	ServiceTierKnown bool
+}
+
+// ThreadCapabilityUpdate uses nil for an omitted field and a pointer to the
+// empty string for an explicit clear/default value.
+type ThreadCapabilityUpdate struct {
+	Model       *string
+	Effort      *string
+	ServiceTier *string
 }
 
 // Store persists only routing metadata. OAuth credentials and conversation
@@ -408,26 +419,30 @@ func (s *Store) SetThreadModel(threadID, model string) error {
 	if model == "" {
 		return errors.New("thread ID and model are required")
 	}
-	return s.UpdateThreadCapability(threadID, ThreadCapability{Model: model})
+	return s.UpdateThreadCapability(threadID, ThreadCapabilityUpdate{Model: &model})
 }
 
 func (s *Store) ThreadCapability(threadID string) ThreadCapability {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	model, modelKnown := s.models[threadID]
+	effort, effortKnown := s.efforts[threadID]
+	serviceTier, serviceTierKnown := s.serviceTiers[threadID]
 	return ThreadCapability{
-		Model:       s.models[threadID],
-		Effort:      s.efforts[threadID],
-		ServiceTier: s.serviceTiers[threadID],
+		Model: model, ModelKnown: modelKnown,
+		Effort: effort, EffortKnown: effortKnown,
+		ServiceTier: serviceTier, ServiceTierKnown: serviceTierKnown,
 	}
 }
 
-// UpdateThreadCapability records only non-empty sticky overrides. Omitted turn
-// parameters keep the previous thread setting.
-func (s *Store) UpdateThreadCapability(threadID string, capability ThreadCapability) error {
+// UpdateThreadCapability applies a three-state capability update. A nil field
+// leaves the existing value unchanged; a non-nil empty value records an
+// explicit clear/default.
+func (s *Store) UpdateThreadCapability(threadID string, capability ThreadCapabilityUpdate) error {
 	if threadID == "" {
 		return errors.New("thread ID is required")
 	}
-	if capability.Model == "" && capability.Effort == "" && capability.ServiceTier == "" {
+	if capability.Model == nil && capability.Effort == nil && capability.ServiceTier == nil {
 		return nil
 	}
 	s.mu.Lock()
@@ -435,9 +450,9 @@ func (s *Store) UpdateThreadCapability(threadID string, capability ThreadCapabil
 	previousModels := mapsClone(s.models)
 	previousEfforts := mapsClone(s.efforts)
 	previousServiceTiers := mapsClone(s.serviceTiers)
-	changed := setNonEmpty(s.models, threadID, capability.Model)
-	changed = setNonEmpty(s.efforts, threadID, capability.Effort) || changed
-	changed = setNonEmpty(s.serviceTiers, threadID, capability.ServiceTier) || changed
+	changed := setCapabilityValue(s.models, threadID, capability.Model)
+	changed = setCapabilityValue(s.efforts, threadID, capability.Effort) || changed
+	changed = setCapabilityValue(s.serviceTiers, threadID, capability.ServiceTier) || changed
 	if !changed {
 		return nil
 	}
@@ -490,11 +505,14 @@ func mapsClone(source map[string]string) map[string]string {
 	return clone
 }
 
-func setNonEmpty(values map[string]string, key, value string) bool {
-	if value == "" || values[key] == value {
+func setCapabilityValue(values map[string]string, key string, value *string) bool {
+	if value == nil {
 		return false
 	}
-	values[key] = value
+	if current, exists := values[key]; exists && current == *value {
+		return false
+	}
+	values[key] = *value
 	return true
 }
 

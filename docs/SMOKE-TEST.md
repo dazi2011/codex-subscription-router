@@ -19,8 +19,21 @@ signature and reuse the same Apple team as the previous installed build.
   pooled usage, and loading states.
 - Start chats until each account has received one; confirm every follow-up stays
   on its original account.
+- Leave a command approval open for more than 30 seconds, then approve it and
+  confirm the original app-server request receives the decision.
+- Run a `command/exec` lasting more than 30 seconds and confirm the Desktop does
+  not report a timeout while the process continues.
 - Spoof one depleted account and confirm the thread continues on an account with
   quota. Spoof all accounts depleted and confirm the combined alert.
+- Open a thread created before Router capability metadata existed, spoof its
+  owner as depleted, and confirm the source resume recovers its effective model
+  before a legacy-history failover.
+- Change an existing thread's model, reasoning effort, and service tier through
+  thread settings; clear the service tier again and confirm failover does not
+  restore the cleared value.
+- Run a thread on a Secondary account and confirm `model/rerouted`,
+  `model/verification`, and `model/safetyBuffering/updated` reach the Desktop;
+  confirm a reroute updates the model used for later failover selection.
 - Open a quota-triggered reset sheet, switch subscriptions, consume a reset, and
   confirm only the selected account changes.
 

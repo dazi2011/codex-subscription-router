@@ -10,9 +10,10 @@ not mean the patched desktop has completed a new signed-app E2E run.
 - **1–5 — model-aware routing and failover.** `model/list` is aggregated and
   de-duplicated across enabled children. New-thread placement queries each
   candidate's model list. Sticky model, reasoning-effort, and service-tier
-  settings are persisted from successful requests, passed to the target where
-  the protocol permits, and required in its catalog. Capability queries include
-  hidden models, and current-turn overrides take precedence over stored values.
+  settings are persisted from effective responses and notifications, passed to
+  the target where the protocol permits, and required in its catalog.
+  Capability queries include hidden models, and current-turn overrides take
+  precedence over stored values.
 - **6–8 — child lifecycle.** Exited children leave the live map, outstanding
   forwarded requests fail explicitly, enabled children restart, and request
   paths can restart a child on demand. Disabled children are not started.
@@ -42,8 +43,10 @@ not mean the patched desktop has completed a new signed-app E2E run.
   percentages into values such as 360%. A single percentage is refused for
   mixed plan types instead of averaging incomparable capacities.
 - **51–55 — initialization and route lifetime.** Child initialization is
-  concurrent under one pool timeout. Desktop-to-child and child-to-desktop
-  routes expire. Child exit fails desktop requests that were awaiting it.
+  concurrent under one pool timeout. Proxied Desktop requests and app-server
+  server requests remain live until their response or owning child exit; they
+  are not cut off by the router's metadata timeout. Child exit fails awaiting
+  Desktop requests and removes orphaned approval routes.
 - **56–60, 63 — history metadata lifecycle.** History aggregation consumes all
   pages for the requested query, reconciles owner/model maps once, avoids
   unchanged state writes, and reports an incomplete child history instead of
@@ -64,8 +67,15 @@ not mean the patched desktop has completed a new signed-app E2E run.
 
 - **Follow-up model/catalog findings.** One failed secondary `model/list` now
   produces a partial union instead of failing the whole selector. Duplicate
-  model entries union advertised reasoning and service-tier options. Existing
-  threads re-check an explicit model/tier change before forwarding.
+  models retain one real account's correlated reasoning/service-tier tuple
+  instead of separately unioning dimensions. Existing threads re-check an
+  explicit model/tier change before forwarding; a catalog lookup error is
+  treated as unknown and keeps the healthy current owner.
+- **Follow-up capability-state findings.** Effective thread responses,
+  `thread/settings/updated`, and `model/rerouted` are authoritative. Capability
+  persistence distinguishes omission from explicit `null`. Historical threads
+  recover effective settings lazily from a source-account resume before target
+  selection, rather than reading a nonexistent model field from `Thread`.
 
 ## Mitigated, not transactional or independently verified
 

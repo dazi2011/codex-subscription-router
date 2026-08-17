@@ -305,7 +305,7 @@ func planLabel(planType string) string {
 }
 
 func (m *Multiplexer) chooseAccountForModel(ctx context.Context, model string) (state.Account, RouteReason, error) {
-	return m.chooseAccountForRequirement(ctx, modelRequirement{Model: model})
+	return m.chooseAccountForRequirement(ctx, modelRequirement{Model: model, ModelKnown: model != ""})
 }
 
 func (m *Multiplexer) chooseAccountForRequirement(
@@ -321,8 +321,11 @@ func (m *Multiplexer) chooseAccountForRequirementExcluding(
 	requirement modelRequirement,
 	source *AccountSnapshot,
 ) (state.Account, RouteReason, error) {
-	if requirement.Model == "" && (requirement.Effort != "" || requirement.ServiceTier != "") {
-		return state.Account{}, RouteReason{}, errUnknownThreadModelCapability
+	if requirement.Model == "" {
+		if requirement.Effort != "" || requirement.ServiceTier != "" ||
+			(source != nil && requirement.ModelKnown) {
+			return state.Account{}, RouteReason{}, errUnknownThreadModelCapability
+		}
 	}
 	snapshots := m.accountSnapshots(ctx, false)
 	capable := make(map[string]bool)

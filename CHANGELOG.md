@@ -22,13 +22,23 @@ this project uses [Semantic Versioning](https://semver.org/).
 - Preserve each thread's sticky model capabilities across failover, give the
   current turn precedence over stored settings, and serialize owner migration
   with notification-safe compare-and-swap and rollback semantics.
+- Learn concrete model settings from app-server effective responses,
+  `thread/settings/updated`, and `model/rerouted`; lazily recover pre-router
+  thread settings from the source account before failover.
+- Preserve the distinction between an omitted capability field and an explicit
+  `null`, including clearing a sticky service tier without restoring it later.
+- Keep one real account's correlated effort/tier tuple for duplicate model
+  entries instead of advertising a cross-account combination that does not
+  exist on any subscription.
+- Let proxied commands, turns, MCP elicitations, and human approvals live until
+  their protocol response or child exit instead of forcing a 30-second timeout.
 - Treat either short- or long-window quota exhaustion as unavailable capacity.
 - Prevent cross-class and cross-workspace organization failover; Personal
   subscriptions remain an explicitly shared pool.
 - Reject paginated-history failover explicitly because the current app-server
   protocol has no verified operation for releasing its single-process writer.
-- Remove exited children from the live pool, restart enabled children, bound
-  forwarded RPC lifetimes, and initialize accounts concurrently.
+- Remove exited children from the live pool, clean connection-owned routes,
+  restart enabled children, and initialize accounts concurrently.
 - De-duplicate merged history without allowing stale account lists to steal a
   migrated thread; filtered and concurrent listings now merge metadata without
   deleting unseen thread assignments.

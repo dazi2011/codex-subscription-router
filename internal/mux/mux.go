@@ -19,7 +19,10 @@ import (
 	"github.com/b-nnett/codex-subscription-router/internal/state"
 )
 
-const requestTimeout = 30 * time.Second
+// controlRequestTimeout applies only to router-owned diagnostic and metadata
+// RPCs. Proxied Desktop requests and app-server approval requests live until
+// their protocol response arrives or the owning connection exits.
+const controlRequestTimeout = 30 * time.Second
 
 type Options struct {
 	RealExecutable string
@@ -37,7 +40,6 @@ type externalRoute struct {
 }
 
 type serverRequestRoute struct {
-	sequence  uint64
 	accountID string
 	original  json.RawMessage
 }
@@ -199,7 +201,7 @@ func (m *Multiplexer) initialize(message protocol.Message) {
 	}
 	entries := m.childEntries()
 	results := make(chan result, len(entries))
-	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), controlRequestTimeout)
 	defer cancel()
 	for _, entry := range entries {
 		go func(entry childEntry) {
@@ -244,7 +246,7 @@ func (m *Multiplexer) handleClientNotification(message protocol.Message) {
 }
 
 func (m *Multiplexer) routeNewThread(message protocol.Message) {
-	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), controlRequestTimeout)
 	defer cancel()
 	account, reason, err := m.chooseAccountForRequirement(ctx, modelRequirementFromParams(message.Params))
 	if err != nil {
@@ -323,22 +325,11 @@ func (m *Multiplexer) forward(accountID string, message protocol.Message) error 
 		m.externalMu.Unlock()
 		return err
 	}
-	time.AfterFunc(requestTimeout, func() {
-		m.externalMu.Lock()
-		route, exists := m.externalRoutes[key]
-		if exists && route.sequence == sequence {
-			delete(m.externalRoutes, key)
-		}
-		m.externalMu.Unlock()
-		if exists && route.sequence == sequence {
-			m.write(protocol.Failure(message.ID, -32030, fmt.Sprintf("%s request timed out", message.Method)))
-		}
-	})
 	return nil
 }
 
 func (m *Multiplexer) routeAggregatedRateLimits(message protocol.Message) {
-	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), controlRequestTimeout)
 	defer cancel()
 	rateLimits, err := m.AggregatedRateLimits(ctx)
 	if err != nil {
@@ -363,23 +354,27 @@ func (m *Multiplexer) routeTurnStart(message protocol.Message, threadID, ownerID
 		m.write(protocol.Failure(message.ID, -32028, err.Error()))
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*requestTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*controlRequestTimeout)
 	defer cancel()
 	snapshot, err := m.accountSnapshotWithProfile(ctx, ownerID, false)
 	requested := modelRequirementFromParams(message.Params)
-	stored := m.store.ThreadCapability(threadID)
-	effective := modelRequirement{
-		Model: stored.Model, Effort: stored.Effort, ServiceTier: stored.ServiceTier,
-	}.overlay(requested)
-	ownerSupportsRequest := true
-	if err == nil && !requested.empty() {
-		ownerSupportsRequest, _ = m.accountSupportsRequirement(ctx, snapshot, effective)
-	}
-	if err == nil && accountHasCapacity(snapshot) && ownerSupportsRequest {
-		if err := m.forward(ownerID, message); err != nil {
-			m.write(protocol.Failure(message.ID, -32023, err.Error()))
+	effective := storedModelRequirement(m.store.ThreadCapability(threadID)).overlay(requested)
+	if err == nil && accountHasCapacity(snapshot) {
+		if requested.empty() {
+			if err := m.forward(ownerID, message); err != nil {
+				m.write(protocol.Failure(message.ID, -32023, err.Error()))
+			}
+			return
 		}
-		return
+		ownerSupportsRequest, capabilityErr := m.accountSupportsRequirement(ctx, snapshot, effective)
+		if capabilityErr != nil || ownerSupportsRequest {
+			// A transient catalog failure is UNKNOWN, not UNSUPPORTED. Keep
+			// the healthy current owner and let its app-server decide.
+			if err := m.forward(ownerID, message); err != nil {
+				m.write(protocol.Failure(message.ID, -32023, err.Error()))
+			}
+			return
+		}
 	}
 	excluded := map[string]struct{}{ownerID: {}}
 	var source *AccountSnapshot
@@ -403,7 +398,7 @@ func (m *Multiplexer) failoverTurn(
 	}
 	resume, err := m.readThreadResumeInfo(ctx, threadID, sourceAccountID)
 	if err != nil {
-		m.write(protocol.Failure(message.ID, -32027, fmt.Sprintf("read chat before failover: %v", err)))
+		m.write(protocol.Failure(message.ID, -32027, fmt.Sprintf("recover chat settings before failover: %v", err)))
 		return
 	}
 	if !historyModeSupportsCrossProcessFailover(resume.HistoryMode) {
@@ -414,16 +409,14 @@ func (m *Multiplexer) failoverTurn(
 		))
 		return
 	}
-	stored := m.store.ThreadCapability(threadID)
-	requirement := modelRequirement{
-		Model: stored.Model, Effort: stored.Effort, ServiceTier: stored.ServiceTier,
-	}.overlay(modelRequirementFromParams(message.Params))
+	sourceCapability := resume.Capability
+	requested := modelRequirementFromParams(message.Params)
+	requirement := resume.Capability.overlay(requested)
 	if requirement.Model == "" {
 		m.write(protocol.Failure(message.ID, -32031, errUnknownThreadModelCapability.Error()))
 		return
 	}
-	resume.Model = requirement.Model
-	resume.ServiceTier = requirement.ServiceTier
+	resume.Capability = requirement
 	fallback, _, err := m.chooseAccountForRequirementExcluding(ctx, excluded, requirement, source)
 	if err != nil {
 		if errors.Is(err, errNoModelCapableSubscription) ||
@@ -436,20 +429,41 @@ func (m *Multiplexer) failoverTurn(
 		}
 		return
 	}
-	if err := m.resumeThreadOnAccount(ctx, resume, fallback.ID); err != nil {
+	targetCapability, err := m.resumeThreadOnAccount(ctx, resume, fallback.ID)
+	if err != nil {
 		m.write(protocol.Failure(message.ID, -32027, fmt.Sprintf("move chat to %s: %v", fallback.Label, err)))
 		return
+	}
+	forwardCapability := requirement.overlay(targetCapability)
+	if requirement.EffortKnown {
+		// thread/resume cannot carry effort. Preserve the source/current-turn
+		// effort on the pending turn even if the target resume response reports
+		// its pre-turn setting.
+		forwardCapability.Effort = requirement.Effort
+		forwardCapability.EffortKnown = true
 	}
 	if err := m.store.CompareAndSwapThreadOwner(threadID, sourceAccountID, fallback.ID); err != nil {
 		m.write(protocol.Failure(message.ID, -32028, err.Error()))
 		return
 	}
-	message.Params = paramsWithModelRequirement(message.Params, requirement)
+	if err := m.store.UpdateThreadCapability(threadID, stateCapabilityUpdate(targetCapability)); err != nil {
+		if rollbackErr := m.store.CompareAndSwapThreadOwner(threadID, fallback.ID, sourceAccountID); rollbackErr != nil {
+			m.write(protocol.Failure(message.ID, -32028, fmt.Sprintf("persist target chat settings: %v; owner rollback failed: %v", err, rollbackErr)))
+		} else {
+			m.write(protocol.Failure(message.ID, -32028, fmt.Sprintf("persist target chat settings: %v", err)))
+		}
+		return
+	}
+	message.Params = paramsWithModelRequirement(message.Params, forwardCapability)
 	if err := m.forward(fallback.ID, message); err != nil {
 		if rollbackErr := m.store.CompareAndSwapThreadOwner(threadID, fallback.ID, sourceAccountID); rollbackErr != nil {
 			m.write(protocol.Failure(message.ID, -32023, fmt.Sprintf("%v; owner rollback failed: %v", err, rollbackErr)))
 		} else {
-			m.write(protocol.Failure(message.ID, -32023, err.Error()))
+			if capabilityRollbackErr := m.store.UpdateThreadCapability(threadID, stateCapabilityUpdate(sourceCapability)); capabilityRollbackErr != nil {
+				m.write(protocol.Failure(message.ID, -32023, fmt.Sprintf("%v; capability rollback failed: %v", err, capabilityRollbackErr)))
+			} else {
+				m.write(protocol.Failure(message.ID, -32023, err.Error()))
+			}
 		}
 		return
 	}
@@ -469,10 +483,80 @@ type threadResumeInfo struct {
 	ID            string
 	Path          string
 	CWD           string
-	Model         string
-	ServiceTier   string
 	ModelProvider string
 	HistoryMode   string
+	Capability    modelRequirement
+}
+
+func threadResumeInfoFromResponse(result json.RawMessage) (threadResumeInfo, error) {
+	var decoded map[string]any
+	if err := json.Unmarshal(result, &decoded); err != nil {
+		return threadResumeInfo{}, err
+	}
+	thread, ok := decoded["thread"].(map[string]any)
+	if !ok {
+		return threadResumeInfo{}, errors.New("response has no thread object")
+	}
+	cwd := anyString(decoded["cwd"])
+	if cwd == "" {
+		cwd = anyString(thread["cwd"])
+	}
+	modelProvider := anyString(decoded["modelProvider"])
+	if modelProvider == "" {
+		modelProvider = anyString(thread["modelProvider"])
+	}
+	return threadResumeInfo{
+		ID:            anyString(thread["id"]),
+		Path:          anyString(thread["path"]),
+		CWD:           cwd,
+		ModelProvider: modelProvider,
+		HistoryMode:   anyString(thread["historyMode"]),
+		Capability:    modelRequirementFromEffectiveSettings(decoded, "reasoningEffort"),
+	}, nil
+}
+
+func modelRequirementFromEffectiveSettings(settings map[string]any, effortKey string) modelRequirement {
+	model, modelKnown := capabilityField(settings, "model")
+	effort, effortKnown := capabilityField(settings, effortKey)
+	serviceTier, serviceTierKnown := capabilityField(settings, "serviceTier")
+	// Effective settings objects are complete snapshots. Optional fields may
+	// be omitted when their effective value is the default/None state.
+	if !effortKnown {
+		effortKnown = true
+	}
+	if !serviceTierKnown {
+		serviceTierKnown = true
+	}
+	return modelRequirement{
+		Model: model, ModelKnown: modelKnown,
+		Effort: effort, EffortKnown: effortKnown,
+		ServiceTier: serviceTier, ServiceTierKnown: serviceTierKnown,
+	}
+}
+
+func storedModelRequirement(capability state.ThreadCapability) modelRequirement {
+	return modelRequirement{
+		Model: capability.Model, ModelKnown: capability.ModelKnown,
+		Effort: capability.Effort, EffortKnown: capability.EffortKnown,
+		ServiceTier: capability.ServiceTier, ServiceTierKnown: capability.ServiceTierKnown,
+	}
+}
+
+func stateCapabilityUpdate(requirement modelRequirement) state.ThreadCapabilityUpdate {
+	update := state.ThreadCapabilityUpdate{}
+	if requirement.ModelKnown {
+		value := requirement.Model
+		update.Model = &value
+	}
+	if requirement.EffortKnown {
+		value := requirement.Effort
+		update.Effort = &value
+	}
+	if requirement.ServiceTierKnown {
+		value := requirement.ServiceTier
+		update.ServiceTier = &value
+	}
+	return update
 }
 
 func (m *Multiplexer) readThreadResumeInfo(ctx context.Context, threadID, sourceAccountID string) (threadResumeInfo, error) {
@@ -480,53 +564,61 @@ func (m *Multiplexer) readThreadResumeInfo(ctx context.Context, threadID, source
 	if err != nil {
 		return threadResumeInfo{}, fmt.Errorf("source subscription is unavailable: %w", err)
 	}
-	readParams, _ := json.Marshal(map[string]any{"threadId": threadID, "includeTurns": false})
-	readResponse, err := source.Request(ctx, "thread/read", readParams)
+	resumeParams, _ := json.Marshal(map[string]any{"threadId": threadID})
+	resumeResponse, err := source.Request(ctx, "thread/resume", resumeParams)
 	if err != nil {
-		return threadResumeInfo{}, fmt.Errorf("read existing chat: %w", err)
+		return threadResumeInfo{}, fmt.Errorf("resume existing chat on source subscription: %w", err)
 	}
-	var readResult struct {
-		Thread struct {
-			ID            string `json:"id"`
-			Path          string `json:"path"`
-			CWD           string `json:"cwd"`
-			ModelProvider string `json:"modelProvider"`
-			HistoryMode   string `json:"historyMode"`
-		} `json:"thread"`
+	info, err := threadResumeInfoFromResponse(resumeResponse.Result)
+	if err != nil {
+		return threadResumeInfo{}, fmt.Errorf("decode source chat settings: %w", err)
 	}
-	if err := json.Unmarshal(readResponse.Result, &readResult); err != nil {
-		return threadResumeInfo{}, fmt.Errorf("decode existing chat: %w", err)
-	}
-	if readResult.Thread.ID == "" {
+	if info.ID == "" {
 		return threadResumeInfo{}, errors.New("existing chat has no thread ID")
 	}
-	if readResult.Thread.HistoryMode != "paginated" && readResult.Thread.Path == "" {
+	if !info.Capability.ModelKnown || info.Capability.Model == "" {
+		return threadResumeInfo{}, errors.New("source chat response has no effective model")
+	}
+	if info.HistoryMode != "paginated" && info.Path == "" {
 		return threadResumeInfo{}, errors.New("existing chat has no resumable history path")
 	}
-	return threadResumeInfo{
-		ID: readResult.Thread.ID, Path: readResult.Thread.Path, CWD: readResult.Thread.CWD,
-		ModelProvider: readResult.Thread.ModelProvider, HistoryMode: readResult.Thread.HistoryMode,
-	}, nil
+	_ = m.store.UpdateThreadCapability(threadID, stateCapabilityUpdate(info.Capability))
+	return info, nil
 }
 
-func (m *Multiplexer) resumeThreadOnAccount(ctx context.Context, info threadResumeInfo, targetAccountID string) error {
+func (m *Multiplexer) resumeThreadOnAccount(
+	ctx context.Context,
+	info threadResumeInfo,
+	targetAccountID string,
+) (modelRequirement, error) {
 	target, err := m.ensureChild(ctx, targetAccountID)
 	if err != nil {
-		return fmt.Errorf("target subscription is unavailable: %w", err)
+		return modelRequirement{}, fmt.Errorf("target subscription is unavailable: %w", err)
 	}
 	params := map[string]any{"threadId": info.ID, "history": nil, "path": info.Path}
 	for key, value := range map[string]string{
-		"cwd": info.CWD, "model": info.Model, "serviceTier": info.ServiceTier, "modelProvider": info.ModelProvider,
+		"cwd": info.CWD, "model": info.Capability.Model, "modelProvider": info.ModelProvider,
 	} {
 		if value != "" {
 			params[key] = value
 		}
 	}
-	resumeParams, _ := json.Marshal(params)
-	if _, err := target.Request(ctx, "thread/resume", resumeParams); err != nil {
-		return fmt.Errorf("resume existing chat: %w", err)
+	if info.Capability.ServiceTierKnown {
+		params["serviceTier"] = nullableCapabilityValue(info.Capability.ServiceTier)
 	}
-	return nil
+	resumeParams, _ := json.Marshal(params)
+	response, err := target.Request(ctx, "thread/resume", resumeParams)
+	if err != nil {
+		return modelRequirement{}, fmt.Errorf("resume existing chat: %w", err)
+	}
+	targetInfo, err := threadResumeInfoFromResponse(response.Result)
+	if err != nil {
+		return modelRequirement{}, fmt.Errorf("decode target chat settings: %w", err)
+	}
+	if !targetInfo.Capability.ModelKnown || targetInfo.Capability.Model == "" {
+		return modelRequirement{}, errors.New("target chat response has no effective model")
+	}
+	return targetInfo.Capability, nil
 }
 
 func (m *Multiplexer) handleServerRequestResponse(message protocol.Message) {
@@ -596,6 +688,12 @@ func (m *Multiplexer) handleInbound(inbound backend.Inbound) {
 			_ = m.store.SetThreadOwnerIfAbsent(threadID, inbound.AccountID)
 		}
 	}
+	if message.Method == "thread/settings/updated" {
+		m.learnEffectiveThreadSettings(inbound.AccountID, message.Params)
+	}
+	if message.Method == "model/rerouted" {
+		m.learnModelReroute(inbound.AccountID, message.Params)
+	}
 	if message.Method == "turn/completed" ||
 		message.Method == "account/login/completed" ||
 		message.Method == "account/updated" {
@@ -607,7 +705,7 @@ func (m *Multiplexer) handleInbound(inbound backend.Inbound) {
 }
 
 func (m *Multiplexer) forwardAggregatedRateLimitNotification(fallback []byte) {
-	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), controlRequestTimeout)
 	defer cancel()
 	rateLimits, err := m.AggregatedRateLimits(ctx)
 	if err != nil {
@@ -628,26 +726,12 @@ func (m *Multiplexer) forwardServerRequest(inbound backend.Inbound) {
 	key := protocol.RequestIDKey(newID)
 	m.serverMu.Lock()
 	m.serverRoutes[key] = serverRequestRoute{
-		sequence:  sequence,
 		accountID: inbound.AccountID,
 		original:  append(json.RawMessage(nil), inbound.Message.ID...),
 	}
 	m.serverMu.Unlock()
 	inbound.Message.ID = newID
 	m.write(inbound.Message)
-	time.AfterFunc(requestTimeout, func() {
-		m.serverMu.Lock()
-		route, exists := m.serverRoutes[key]
-		if exists && route.sequence == sequence {
-			delete(m.serverRoutes, key)
-		}
-		m.serverMu.Unlock()
-		if exists && route.sequence == sequence {
-			if child, ok := m.child(route.accountID); ok {
-				_ = child.Send(protocol.Failure(route.original, -32030, "desktop request timed out"))
-			}
-		}
-	})
 }
 
 func (m *Multiplexer) shouldForwardNotification(accountID, method string) bool {
@@ -658,30 +742,67 @@ func (m *Multiplexer) shouldForwardNotification(accountID, method string) bool {
 	return strings.HasPrefix(method, "thread/") ||
 		strings.HasPrefix(method, "turn/") ||
 		strings.HasPrefix(method, "item/") ||
+		strings.HasPrefix(method, "model/") ||
 		strings.HasPrefix(method, "hook/") ||
 		strings.HasPrefix(method, "rawResponse")
 }
 
 func (m *Multiplexer) learnThreadOwner(route externalRoute, accountID string, result json.RawMessage) {
 	switch route.method {
-	case "thread/start", "thread/fork", "thread/resume", "thread/unarchive":
+	case "thread/start", "thread/fork", "thread/resume":
 		if threadID := threadIDFromResult(result); threadID != "" {
 			_ = m.store.SetThreadOwner(threadID, accountID)
-			m.learnThreadCapability(threadID, route.message.Params)
+			if info, err := threadResumeInfoFromResponse(result); err == nil {
+				_ = m.store.UpdateThreadCapability(threadID, stateCapabilityUpdate(info.Capability))
+			}
 		}
-	case "turn/start":
+	case "thread/unarchive":
+		if threadID := threadIDFromResult(result); threadID != "" {
+			_ = m.store.SetThreadOwner(threadID, accountID)
+		}
+	case "turn/start", "thread/settings/update":
 		if threadID := threadIDFromParams(route.message.Params); threadID != "" {
 			_ = m.store.SetThreadOwner(threadID, accountID)
-			m.learnThreadCapability(threadID, route.message.Params)
 		}
 	}
 }
 
-func (m *Multiplexer) learnThreadCapability(threadID string, params json.RawMessage) {
-	requirement := modelRequirementFromParams(params)
-	_ = m.store.UpdateThreadCapability(threadID, state.ThreadCapability{
-		Model: requirement.Model, Effort: requirement.Effort, ServiceTier: requirement.ServiceTier,
-	})
+func (m *Multiplexer) learnEffectiveThreadSettings(accountID string, params json.RawMessage) {
+	var decoded map[string]any
+	if json.Unmarshal(params, &decoded) != nil {
+		return
+	}
+	threadID := anyString(decoded["threadId"])
+	settings, ok := decoded["threadSettings"].(map[string]any)
+	if threadID == "" || !ok || !m.notificationOwnsThread(threadID, accountID) {
+		return
+	}
+	requirement := modelRequirementFromEffectiveSettings(settings, "effort")
+	_ = m.store.UpdateThreadCapability(threadID, stateCapabilityUpdate(requirement))
+}
+
+func (m *Multiplexer) learnModelReroute(accountID string, params json.RawMessage) {
+	var decoded map[string]any
+	if json.Unmarshal(params, &decoded) != nil {
+		return
+	}
+	threadID := anyString(decoded["threadId"])
+	toModel := anyString(decoded["toModel"])
+	if threadID == "" || toModel == "" || !m.notificationOwnsThread(threadID, accountID) {
+		return
+	}
+	_ = m.store.UpdateThreadCapability(threadID, state.ThreadCapabilityUpdate{Model: &toModel})
+}
+
+func (m *Multiplexer) notificationOwnsThread(threadID, accountID string) bool {
+	owner, exists := m.store.ThreadOwner(threadID)
+	if !exists {
+		if err := m.store.SetThreadOwnerIfAbsent(threadID, accountID); err != nil {
+			return false
+		}
+		owner, exists = m.store.ThreadOwner(threadID)
+	}
+	return exists && owner == accountID
 }
 
 func (m *Multiplexer) write(message protocol.Message) {
@@ -772,7 +893,7 @@ func (m *Multiplexer) startChild(ctx context.Context, account state.Account) (*b
 	initialized := m.initialized
 	m.initializationMu.RUnlock()
 	if len(params) > 0 {
-		requestCtx, cancel := context.WithTimeout(ctx, requestTimeout)
+		requestCtx, cancel := context.WithTimeout(ctx, controlRequestTimeout)
 		_, err := child.Request(requestCtx, "initialize", params)
 		cancel()
 		if err != nil {
@@ -824,6 +945,7 @@ func (m *Multiplexer) stopChild(ctx context.Context, accountID string) error {
 		return nil
 	}
 	m.failExternalRoutes(accountID, "subscription was stopped")
+	m.dropServerRoutes(accountID)
 	_ = child.Close()
 	grace := time.NewTimer(2 * time.Second)
 	defer grace.Stop()
@@ -858,6 +980,7 @@ func (m *Multiplexer) watchChild(accountID string, child *backend.Child) {
 		return
 	}
 	m.failExternalRoutes(accountID, "Codex app-server exited before responding")
+	m.dropServerRoutes(accountID)
 
 	if m.lifecycle == nil {
 		return
@@ -892,6 +1015,16 @@ func (m *Multiplexer) failExternalRoutes(accountID, reason string) {
 	m.externalMu.Unlock()
 	for _, route := range failed {
 		m.write(protocol.Failure(route.id, -32032, fmt.Sprintf("%s: %s", route.method, reason)))
+	}
+}
+
+func (m *Multiplexer) dropServerRoutes(accountID string) {
+	m.serverMu.Lock()
+	defer m.serverMu.Unlock()
+	for key, route := range m.serverRoutes {
+		if route.accountID == accountID {
+			delete(m.serverRoutes, key)
+		}
 	}
 }
 

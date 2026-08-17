@@ -31,12 +31,24 @@ multiplexer resumes the rollout on an account with capacity that advertises
 the thread's concrete model, reasoning effort, and service tier. Capability
 queries include hidden catalog entries. The model selector is the
 de-duplicated union of successful enabled-child `model/list` responses, and a
-single failed secondary no longer hides every other account's catalog.
+single failed secondary no longer hides every other account's catalog. When
+the same model occurs on multiple accounts, the selector retains one actual
+account's complete capability tuple. It does not independently union effort
+and tier dimensions, which would advertise combinations that no account has.
 
 Thread owner, model, reasoning effort, and service tier metadata are persisted
-together. Explicit settings on the current turn override sticky values. A
-successful failover injects the effective values into the first target turn so
-the target does not silently fall back to different defaults. Per-thread locks
+together. The router learns authoritative settings from effective
+`thread/start`, `thread/resume`, and `thread/fork` responses, plus
+`thread/settings/updated` and `model/rerouted` notifications. Omitted fields
+leave stored state unchanged; explicit `null` values record a cleared/default
+setting. Before a failover, the source process is resumed/rejoined without
+overrides so historical pre-router threads can recover their effective model
+without relying on a nonexistent `Thread.model` field. Explicit settings on
+the current turn then override those source settings.
+
+A successful failover uses the target resume response as the effective model
+baseline and injects the resulting values into the first target turn so the
+target does not silently fall back to different defaults. Per-thread locks
 serialize failover; asynchronous `thread/started` notifications can only learn
 a previously unknown owner, and owner changes use idempotent compare-and-swap
 plus rollback when the target request cannot be sent.
@@ -57,9 +69,14 @@ metadata; this also prevents a stale listing from deleting a thread created
 while the listing was in flight.
 
 Child exit removes that process from the live map, fails outstanding desktop
-RPCs, and restarts the child while its account remains enabled. Forwarded RPC
-and server-request route entries have bounded lifetimes. Initialization fans
-out concurrently under one timeout.
+RPCs, drops its outstanding server-request routes, and restarts the child while
+its account remains enabled. Proxied Desktop RPCs and app-server-initiated
+requests have protocol lifetimes: they remain routed until a response arrives
+or the owning child/connection exits. The 30-second control timeout is limited
+to router-owned metadata and diagnostic calls, so a long `command/exec`, MCP
+elicitation, or human approval is not converted into a false timeout while the
+real operation continues. Initialization fans out concurrently under one
+control timeout.
 
 ## Account isolation
 
