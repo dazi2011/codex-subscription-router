@@ -106,6 +106,13 @@ dependency, creates the independently signed app, and launches it:
 curl -fsSL https://raw.githubusercontent.com/dazi2011/codex-subscription-router/main/install.sh | /bin/bash
 ```
 
+> [!CAUTION]
+> This fork's audit remediations have source-level validation but do not yet
+> have a signed-app E2E report or immutable release tag. The command above
+> follows this fork's `main`. Inspect and pin a reviewed commit when
+> reproducibility matters; do not treat the older v0.1.0 E2E report as evidence
+> for the remediated code.
+
 The installer keeps its source checkout in
 `~/.codex-subscription-router/source`. On an existing installation it uses the
 same account state, creates a recoverable backup, and requires signing-team
