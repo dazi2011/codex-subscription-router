@@ -24,6 +24,9 @@ binaries or a prebuilt application.
 
 - **Quota-aware routing.** New chats favour weekly allowance that will expire
   sooner, with a bounded boost for accounts holding banked usage resets.
+- **Disposable subscriptions.** An account added as temporary is preferred for
+  new chats and ordinary failover, then automatically removed after an explicit
+  subscription 429 or terminal token/reauthentication failure.
 - **Sticky conversations.** Once a thread is assigned, every follow-up returns
   to the same subscription unless that subscription is depleted.
 - **Guarded automatic failover.** A depleted legacy-history thread continues
@@ -69,10 +72,11 @@ Codex Subscription Router.app
              └── thread ID → persistent account owner
 ```
 
-New-thread routing compares the quota burn rate needed before each weekly reset,
-then applies a capped banked-reset boost. Short-window usage, pinned-thread
-count, and stable account order break close results. Existing threads do not
-migrate merely for load balancing.
+New-thread routing first prefers eligible temporary subscriptions, then compares
+the quota burn rate needed before each weekly reset and applies a capped
+banked-reset boost. Short-window usage, pinned-thread count, and stable account
+order break close results. Existing threads do not migrate merely for load
+balancing.
 
 Read [the architecture](docs/ARCHITECTURE.md) for the request flow and
 [the security model](docs/SECURITY-MODEL.md) for trust boundaries.
@@ -195,7 +199,9 @@ request Automation access the first time Computer Use controls another app.
 ## Add subscriptions
 
 1. Open the profile menu at the bottom of the sidebar.
-2. Select **Add another subscription**.
+2. Select **Add regular subscription**, or **Add temporary subscription** for a
+   disposable account that should be consumed first and removed automatically
+   after a confirmed 429 or terminal authentication failure.
 3. Complete the displayed device-code sign-in in your browser.
 4. Return to Codex Subscription Router and wait for the account row to appear.
 
@@ -203,14 +209,14 @@ While the code is visible, clicking away does not dismiss the menu. Clicking
 the code copies it and opens the verification page.
 
 The profile menu displays combined weekly usage followed by one row per
-subscription. Email addresses remain masked until hovered. The final row always
-starts another sign-in.
+subscription. Temporary rows are labeled explicitly. Email addresses remain
+masked until hovered. The final two rows start regular or temporary sign-in.
 
 ## Routing behavior
 
 | Situation | Behaviour |
 | --- | --- |
-| New chat | Assigned by quota-at-risk, banked resets, and short-window pressure |
+| New chat | Eligible temporary accounts first; otherwise assigned by quota-at-risk, banked resets, and short-window pressure |
 | Follow-up | Sent to the thread's persisted account owner |
 | Either owner quota window depleted | Continued only through a capability- and data-boundary-compatible account |
 | Existing thread changes model/tier | Owner capability is rechecked; a compatible legacy thread can move |
@@ -223,6 +229,8 @@ starts another sign-in.
 | Approval or command exceeds 30 seconds | Remains pending until its real response or child exit |
 | Paginated thread needs failover | Rejected explicitly; no verified cross-process writer-release RPC exists |
 | Post-submit quota error | Original error returned without replaying side effects |
+| Temporary account returns a direct 429 before the turn starts | Current request is moved through normal capability/data-boundary failover, then the temporary account is removed |
+| Temporary account reports 429 or terminal authentication failure during a running turn/probe | Owned resumable threads are moved best-effort for subsequent turns; the credential and account row are removed immediately after evacuation |
 | Every account depleted | Combined quota alert with the next known reset |
 | Account disabled | Excluded from routing and pooled usable quota |
 
@@ -268,7 +276,7 @@ helper and socket paths and are not relocatable or intended for redistribution.
 | --- | --- |
 | `~/.codex` | Primary credentials, conversations, and cache |
 | `~/.codex-mux/state.json` | Account metadata plus sticky thread owner and effective model settings |
-| `~/.codex-mux/accounts/<id>/codex-home` | Isolated secondary account data |
+| `~/.codex-mux/accounts/<id>/codex-home` | Isolated secondary account data; an auto-retired temporary account keeps credential-free rollout history so migrated chats remain resumable |
 | `~/.codex-mux/control-token` | Token for the loopback-only control service |
 | `~/.codex-mux/backups` | Recoverable app and helper backups |
 | `~/Library/Application Support/Codex Subscription Router` | Independent desktop profile |

@@ -123,6 +123,9 @@ type Multiplexer struct {
 	resetPreviewMu sync.RWMutex
 	resetPreviews  map[string]ResetCreditsPreview
 
+	temporaryMu       sync.RWMutex
+	temporaryRetiring map[string]struct{}
+
 	threadLocks        [64]sync.Mutex
 	threadListCursorMu sync.Mutex
 	threadListCursors  map[string]threadListCursorState
@@ -152,6 +155,7 @@ func New(options Options) (*Multiplexer, error) {
 		resetCreditsCache:    make(map[string]resetCreditsCacheEntry),
 		resetCreditsEndpoint: rateLimitResetCreditsURL,
 		resetPreviews:        make(map[string]ResetCreditsPreview),
+		temporaryRetiring:    make(map[string]struct{}),
 		threadListCursors:    make(map[string]threadListCursorState),
 	}, nil
 }
@@ -465,7 +469,8 @@ func (m *Multiplexer) routeTurnStart(message protocol.Message, threadID, ownerID
 	requested := modelRequirementFromParams(message.Params)
 	effective := storedModelRequirement(m.store.ThreadCapability(threadID)).overlay(requested)
 	if err == nil && accountEligibleForRouting(snapshot) &&
-		accountQuotaState(snapshot) != quotaCapacityExhausted {
+		accountQuotaState(snapshot) != quotaCapacityExhausted &&
+		!m.temporaryAccountRetiring(ownerID) {
 		if effective.Model == "" {
 			if err := m.forward(ownerID, message); err != nil {
 				m.write(protocol.Failure(message.ID, -32023, err.Error()))
@@ -870,6 +875,11 @@ func (m *Multiplexer) handleInbound(inbound backend.Inbound) {
 			if route.unsubscribeAccountID != "" && route.unsubscribeThreadID != "" {
 				go m.unsubscribeThreadOnAccount(route.unsubscribeAccountID, route.unsubscribeThreadID)
 			}
+			if m.maybeHandleTemporaryExternalFailure(
+				inbound.AccountID, route, message, inbound.Raw,
+			) {
+				return
+			}
 			if route.method == "turn/start" && isUsageLimitResponse(message) {
 				go m.publishAccountRefresh(inbound.AccountID)
 				m.publish(Event{
@@ -912,6 +922,7 @@ func (m *Multiplexer) handleInbound(inbound backend.Inbound) {
 	) {
 		return
 	}
+	m.maybeRetireTemporaryNotification(inbound.AccountID, message)
 	if message.Method == "account/rateLimits/updated" {
 		go m.forwardAggregatedRateLimitNotification(inbound.Raw)
 		return
@@ -1296,6 +1307,9 @@ func (m *Multiplexer) startChild(ctx context.Context, account state.Account) (*b
 	if !account.Enabled {
 		return nil, fmt.Errorf("account %s is disabled", account.ID)
 	}
+	if m.temporaryAccountRetiring(account.ID) {
+		return nil, fmt.Errorf("temporary account %s is being retired", account.ID)
+	}
 	m.startMu.Lock()
 	defer m.startMu.Unlock()
 	select {
@@ -1383,6 +1397,9 @@ func (m *Multiplexer) discardChild(accountID string, child *backend.Child, reaso
 func (m *Multiplexer) ensureChild(ctx context.Context, accountID string) (*backend.Child, error) {
 	if child, ok := m.child(accountID); ok {
 		return child, nil
+	}
+	if m.temporaryAccountRetiring(accountID) {
+		return nil, fmt.Errorf("temporary account %s is being retired", accountID)
 	}
 	account, ok := m.store.Account(accountID)
 	if !ok {

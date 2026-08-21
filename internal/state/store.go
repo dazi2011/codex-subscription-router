@@ -23,6 +23,7 @@ type Account struct {
 	CodexHome  string `json:"codexHome"`
 	Enabled    bool   `json:"enabled"`
 	Controller bool   `json:"controller"`
+	Temporary  bool   `json:"temporary,omitempty"`
 	CreatedAt  int64  `json:"createdAt"`
 }
 
@@ -219,6 +220,14 @@ func (s *Store) Controller() (Account, bool) {
 }
 
 func (s *Store) AddAccount(label string) (Account, error) {
+	return s.addAccount(label, false)
+}
+
+func (s *Store) AddTemporaryAccount(label string) (Account, error) {
+	return s.addAccount(label, true)
+}
+
+func (s *Store) addAccount(label string, temporary bool) (Account, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -248,6 +257,7 @@ func (s *Store) AddAccount(label string) (Account, error) {
 		Label:     label,
 		CodexHome: codexHome,
 		Enabled:   true,
+		Temporary: temporary,
 		CreatedAt: time.Now().Unix(),
 	}
 	s.accounts = append(s.accounts, account)
@@ -260,6 +270,18 @@ func (s *Store) AddAccount(label string) (Account, error) {
 }
 
 func (s *Store) RemoveAccount(id string) (Account, error) {
+	return s.removeAccount(id, false)
+}
+
+// RetireTemporaryAccount removes a disposable subscription and its credential
+// while retaining the credential-free Codex home. Cross-account resume uses
+// rollout paths from that home, so deleting it here would break chats that were
+// moved away immediately before retirement.
+func (s *Store) RetireTemporaryAccount(id string) (Account, error) {
+	return s.removeAccount(id, true)
+}
+
+func (s *Store) removeAccount(id string, preserveHistory bool) (Account, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	index := -1
@@ -276,6 +298,9 @@ func (s *Store) RemoveAccount(id string) (Account, error) {
 	}
 	if removed.Controller || samePath(removed.CodexHome, s.primaryCodexHome) {
 		return Account{}, errors.New("the primary subscription cannot be removed")
+	}
+	if preserveHistory && !removed.Temporary {
+		return Account{}, errors.New("only a temporary subscription can be retired")
 	}
 	accountRoot := filepath.Join(s.root, "accounts", id)
 	if !samePath(filepath.Dir(removed.CodexHome), accountRoot) {
@@ -327,6 +352,14 @@ func (s *Store) RemoveAccount(id string) (Account, error) {
 		s.serviceTiers = previousServiceTiers
 		s.controllerReasons = previousControllerReasons
 		return Account{}, err
+	}
+	if preserveHistory {
+		for _, name := range []string{"auth.json", "auth.json.tmp"} {
+			if err := os.Remove(filepath.Join(removed.CodexHome, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return removed, fmt.Errorf("remove temporary account credential: %w", err)
+			}
+		}
+		return removed, nil
 	}
 	if err := os.RemoveAll(accountRoot); err != nil {
 		return removed, fmt.Errorf("remove account home: %w", err)
@@ -694,6 +727,19 @@ func (s *Store) ThreadCounts() map[string]int {
 		counts[accountID]++
 	}
 	return counts
+}
+
+func (s *Store) ThreadIDsForAccount(accountID string) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	threadIDs := make([]string, 0)
+	for threadID, ownerID := range s.owners {
+		if ownerID == accountID {
+			threadIDs = append(threadIDs, threadID)
+		}
+	}
+	slices.Sort(threadIDs)
+	return threadIDs
 }
 
 func (s *Store) saveLocked() error {

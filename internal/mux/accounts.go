@@ -51,6 +51,7 @@ type AccountSnapshot struct {
 	Label           string          `json:"label"`
 	Enabled         bool            `json:"enabled"`
 	Controller      bool            `json:"controller"`
+	Temporary       bool            `json:"temporary"`
 	Connected       bool            `json:"connected"`
 	Healthy         bool            `json:"healthy"`
 	Email           string          `json:"email,omitempty"`
@@ -89,11 +90,18 @@ func (m *Multiplexer) accountSnapshots(ctx context.Context, includeProfile bool)
 				results <- m.storedAccountSnapshot(account)
 				return
 			}
+			if m.temporaryAccountRetiring(account.ID) {
+				snapshot := m.storedAccountSnapshot(account)
+				snapshot.Error = "temporary subscription is being retired"
+				results <- snapshot
+				return
+			}
 			snapshot, err := m.accountSnapshotWithProfile(ctx, account.ID, includeProfile)
 			if err != nil {
 				snapshot = AccountSnapshot{
 					ID: account.ID, Label: account.Label, Enabled: account.Enabled,
-					Controller: account.Controller, CreatedAt: account.CreatedAt, Error: err.Error(),
+					Controller: account.Controller, Temporary: account.Temporary,
+					CreatedAt: account.CreatedAt, Error: err.Error(),
 				}
 			}
 			results <- snapshot
@@ -117,8 +125,14 @@ func (m *Multiplexer) accountSnapshots(ctx context.Context, includeProfile bool)
 	return snapshots
 }
 
-func (m *Multiplexer) AddAccount(ctx context.Context, label string) (AccountSnapshot, error) {
-	account, err := m.store.AddAccount(label)
+func (m *Multiplexer) AddAccount(ctx context.Context, label string, temporary bool) (AccountSnapshot, error) {
+	var account state.Account
+	var err error
+	if temporary {
+		account, err = m.store.AddTemporaryAccount(label)
+	} else {
+		account, err = m.store.AddAccount(label)
+	}
 	if err != nil {
 		return AccountSnapshot{}, err
 	}
@@ -170,6 +184,12 @@ func (m *Multiplexer) RemoveAccount(ctx context.Context, id string) error {
 		}
 		return err
 	}
+	m.forgetAccountCaches(id)
+	m.publish(Event{Type: "account-removed", AccountID: id})
+	return nil
+}
+
+func (m *Multiplexer) forgetAccountCaches(id string) {
 	m.profileMu.Lock()
 	delete(m.profileCache, id)
 	m.profileMu.Unlock()
@@ -179,14 +199,12 @@ func (m *Multiplexer) RemoveAccount(ctx context.Context, id string) error {
 	m.resetPreviewMu.Lock()
 	delete(m.resetPreviews, id)
 	m.resetPreviewMu.Unlock()
-	m.publish(Event{Type: "account-removed", AccountID: id})
-	return nil
 }
 
 func (m *Multiplexer) storedAccountSnapshot(account state.Account) AccountSnapshot {
 	return AccountSnapshot{
 		ID: account.ID, Label: account.Label, Enabled: account.Enabled,
-		Controller: account.Controller, CreatedAt: account.CreatedAt,
+		Controller: account.Controller, Temporary: account.Temporary, CreatedAt: account.CreatedAt,
 		ThreadCount: m.store.ThreadCounts()[account.ID],
 	}
 }
@@ -229,6 +247,35 @@ func (m *Multiplexer) accountSnapshot(ctx context.Context, accountID string) (Ac
 }
 
 func (m *Multiplexer) accountSnapshotWithProfile(ctx context.Context, accountID string, includeProfile bool) (AccountSnapshot, error) {
+	snapshot, err := m.accountIdentitySnapshot(ctx, accountID, includeProfile)
+	if err != nil {
+		return AccountSnapshot{}, err
+	}
+	if !snapshot.Connected || snapshot.AuthType != "chatgpt" {
+		m.applyRateLimitPreview(&snapshot)
+		return snapshot, nil
+	}
+	account, _ := m.store.Account(accountID)
+	child, err := m.ensureChild(ctx, accountID)
+	if err != nil {
+		return AccountSnapshot{}, fmt.Errorf("account %q app-server is unavailable: %w", accountID, err)
+	}
+	rateResponse, rateErr := child.Request(ctx, "account/rateLimits/read", nil)
+	if rateErr == nil {
+		var rateResult struct {
+			RateLimits RateLimits `json:"rateLimits"`
+		}
+		if json.Unmarshal(rateResponse.Result, &rateResult) == nil {
+			snapshot.RateLimits = &rateResult.RateLimits
+		}
+	} else if m.maybeRetireTemporaryProbe(account, "account/rateLimits/read", rateResponse) {
+		return AccountSnapshot{}, fmt.Errorf("temporary account %q was retired after quota/authentication probe failure", accountID)
+	}
+	m.applyRateLimitPreview(&snapshot)
+	return snapshot, nil
+}
+
+func (m *Multiplexer) accountIdentitySnapshot(ctx context.Context, accountID string, includeProfile bool) (AccountSnapshot, error) {
 	account, ok := m.store.Account(accountID)
 	if !ok {
 		return AccountSnapshot{}, fmt.Errorf("account %q not found", accountID)
@@ -240,6 +287,7 @@ func (m *Multiplexer) accountSnapshotWithProfile(ctx context.Context, accountID 
 	params := json.RawMessage(`{"refreshToken":false}`)
 	accountResponse, err := child.Request(ctx, "account/read", params)
 	if err != nil {
+		m.maybeRetireTemporaryProbe(account, "account/read", accountResponse)
 		return AccountSnapshot{}, err
 	}
 	var accountResult struct {
@@ -250,8 +298,9 @@ func (m *Multiplexer) accountSnapshotWithProfile(ctx context.Context, accountID 
 	}
 	snapshot := AccountSnapshot{
 		ID: account.ID, Label: account.Label, Enabled: account.Enabled,
-		Controller: account.Controller, Connected: string(accountResult.Account) != "null" && len(accountResult.Account) > 0,
-		Healthy: true, CreatedAt: account.CreatedAt, RawAccount: accountResult.Account,
+		Controller: account.Controller, Temporary: account.Temporary,
+		Connected: string(accountResult.Account) != "null" && len(accountResult.Account) > 0,
+		Healthy:   true, CreatedAt: account.CreatedAt, RawAccount: accountResult.Account,
 		ThreadCount: m.store.ThreadCounts()[account.ID],
 	}
 	if snapshot.Connected {
@@ -272,18 +321,8 @@ func (m *Multiplexer) accountSnapshotWithProfile(ctx context.Context, accountID 
 			if credentials, authErr := readAuthFile(filepath.Join(account.CodexHome, "auth.json")); authErr == nil {
 				snapshot.WorkspaceID = credentials.Tokens.AccountID
 			}
-			rateResponse, rateErr := child.Request(ctx, "account/rateLimits/read", nil)
-			if rateErr == nil {
-				var rateResult struct {
-					RateLimits RateLimits `json:"rateLimits"`
-				}
-				if json.Unmarshal(rateResponse.Result, &rateResult) == nil {
-					snapshot.RateLimits = &rateResult.RateLimits
-				}
-			}
 		}
 	}
-	m.applyRateLimitPreview(&snapshot)
 	return snapshot, nil
 }
 
@@ -357,7 +396,8 @@ func (m *Multiplexer) chooseAccountForRequirementExcluding(
 		if _, skip := excluded[snapshot.ID]; skip {
 			continue
 		}
-		if !snapshot.Enabled || !snapshot.Connected || snapshot.AuthType != "chatgpt" {
+		if !snapshot.Enabled || !snapshot.Connected || snapshot.AuthType != "chatgpt" ||
+			m.temporaryAccountRetiring(snapshot.ID) {
 			continue
 		}
 		if source != nil && !sameDataBoundary(*source, snapshot) {
@@ -461,6 +501,9 @@ collectResetCredits:
 
 	sort.SliceStable(candidates, func(i, j int) bool {
 		left, right := candidates[i], candidates[j]
+		if temporaryRoutingPriority(left.account) != temporaryRoutingPriority(right.account) {
+			return temporaryRoutingPriority(left.account) < temporaryRoutingPriority(right.account)
+		}
 		if math.Abs(left.urgency-right.urgency) > 0.000001 {
 			return left.urgency > right.urgency
 		}
@@ -476,6 +519,13 @@ collectResetCredits:
 		return left.account.CreatedAt < right.account.CreatedAt
 	})
 	return candidates[0].account, candidates[0].reason, nil
+}
+
+func temporaryRoutingPriority(account state.Account) int {
+	if account.Temporary {
+		return 0
+	}
+	return 1
 }
 
 func routeUrgencyScore(now time.Time, weekly *RateLimitWindow, credits resetCreditMetadata) float64 {

@@ -1,8 +1,12 @@
 package mux
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
+
+	"github.com/b-nnett/codex-subscription-router/internal/protocol"
+	"github.com/b-nnett/codex-subscription-router/internal/state"
 )
 
 func TestPlanLabel(t *testing.T) {
@@ -21,6 +25,97 @@ func TestPlanLabel(t *testing.T) {
 		if got := planLabel(planType); got != want {
 			t.Errorf("planLabel(%q) = %q, want %q", planType, got, want)
 		}
+	}
+}
+
+func TestTemporaryAccountsHaveStrictRoutingPriority(t *testing.T) {
+	regular := state.Account{ID: "regular"}
+	temporary := state.Account{ID: "temporary", Temporary: true}
+	if temporaryRoutingPriority(temporary) >= temporaryRoutingPriority(regular) {
+		t.Fatal("temporary account did not sort ahead of the regular pool")
+	}
+}
+
+func TestTemporaryFailureClassificationIsNarrow(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		input  protocol.Message
+		want   temporaryFailureKind
+	}{
+		{
+			name: "structured 429", method: "turn/start",
+			input: protocol.Message{Error: &protocol.RPCError{
+				Code: -32000, Message: "turn failed",
+				Data: json.RawMessage(`{"codexErrorInfo":{"httpConnectionFailed":{"httpStatusCode":429}}}`),
+			}},
+			want: temporaryFailureQuota,
+		},
+		{
+			name: "structured unauthorized", method: "turn/start",
+			input: protocol.Message{Error: &protocol.RPCError{
+				Code: -32000, Message: "turn failed",
+				Data: json.RawMessage(`{"codexErrorInfo":"unauthorized"}`),
+			}},
+			want: temporaryFailureAuthentication,
+		},
+		{
+			name: "terminal refresh message", method: "account/read",
+			input: protocol.Message{Error: &protocol.RPCError{
+				Code: -32000, Message: "Access token could not be refreshed; please sign in again",
+			}},
+			want: temporaryFailureAuthentication,
+		},
+		{
+			name: "entitlement 403 is not a ban", method: "turn/start",
+			input: protocol.Message{Error: &protocol.RPCError{
+				Code: -32000, Message: "model entitlement denied",
+				Data: json.RawMessage(`{"httpStatusCode":403,"code":"permission_denied"}`),
+			}},
+			want: temporaryFailureNone,
+		},
+		{
+			name: "tool 429 is not subscription quota", method: "mcpServer/oauth/login",
+			input: protocol.Message{Error: &protocol.RPCError{
+				Code: -32000, Message: "MCP server returned HTTP 429",
+			}},
+			want: temporaryFailureNone,
+		},
+		{
+			name: "turn tool 429 is not subscription quota", method: "turn/start",
+			input: protocol.Message{Error: &protocol.RPCError{
+				Code: -32000, Message: "MCP server returned HTTP 429",
+				Data: json.RawMessage(`{"code":"usage_limit_exceeded","source":"mcp"}`),
+			}},
+			want: temporaryFailureNone,
+		},
+		{
+			name: "tool unauthorized is not account auth", method: "mcpServer/oauth/login",
+			input: protocol.Message{Error: &protocol.RPCError{
+				Code: -32000, Message: "MCP server unauthorized",
+				Data: json.RawMessage(`{"codexErrorInfo":"unauthorized"}`),
+			}},
+			want: temporaryFailureNone,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := temporaryFailureFromRPC(test.method, test.input); got != test.want {
+				t.Fatalf("classification = %v, want %v", got, test.want)
+			}
+		})
+	}
+	if got := temporaryFailureFromPayload(json.RawMessage(`{
+		"threadId":"thread-1",
+		"turn":{"error":{"codexErrorInfo":"usageLimitExceeded","message":"quota"}}
+	}`), true); got != temporaryFailureQuota {
+		t.Fatalf("turn/completed usage limit = %v, want quota", got)
+	}
+	if got := temporaryFailureFromPayload(json.RawMessage(`{
+		"threadId":"thread-1",
+		"turn":{"error":{"codexErrorInfo":null,"message":"MCP server returned HTTP 429"}}
+	}`), true); got != temporaryFailureNone {
+		t.Fatalf("tool-level notification 429 = %v, want ignored", got)
 	}
 }
 

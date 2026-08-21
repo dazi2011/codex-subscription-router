@@ -22,6 +22,8 @@ remaining divided by the hours until that account resets. Banked usage resets
 add a capped bonus, while short-window usage, existing pinned-thread count, and
 stable account order break close results. Reset-credit metadata is fetched in
 parallel, cached for five minutes, and treated as neutral when unavailable.
+Eligible temporary accounts form a strict priority class ahead of regular
+accounts; the existing quota score orders accounts inside that class.
 Quota observations have three states: available, exhausted, and unknown. A
 temporary `account/rateLimits/read` failure keeps the current healthy owner and
 does not make the pool appear depleted. New routing prefers accounts with
@@ -70,6 +72,17 @@ current app-server schema exposes no verified operation that releases the
 single-process writer. A quota error received after `turn/start` was submitted
 is not replayed, because the router cannot prove the failed turn had no
 external side effects. Threads do not migrate for ordinary load balancing.
+
+Temporary accounts add an explicit disposable lifecycle. Structured
+`usageLimitExceeded`, upstream HTTP 429, `unauthorized`/401, and narrow terminal
+token-refresh messages trigger retirement. Generic 403 entitlement failures,
+tool-specific 429s, timeouts, and 5xx responses do not. A direct rejected
+`turn/start` can be retried after the thread is resumed on a compatible normal
+candidate because no successful start response was returned. Failures reported
+after a turn has begun are not replayed; instead, resumable owned threads are
+evacuated for later turns. Retirement stops the child, removes the account from
+`state.json`, and deletes `auth.json`. The now credential-free Codex home is
+retained because target resumes reference its rollout paths.
 
 `thread/list` results are always treated as partial observations because the
 protocol supports search, working-directory, archive, source, and ancestry

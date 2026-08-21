@@ -336,7 +336,7 @@ function CodexMuxAccountMenu() {
 	const incomplete = accounts.filter(
 	(account) => !account.controller && !account.connected && !account.error,
 	);
-  async function addSubscription(event) {
+  async function addSubscription(event, temporary = false) {
     event.preventDefault();
     if (busy) return;
     setBusy(true);
@@ -345,7 +345,7 @@ function CodexMuxAccountMenu() {
 	try {
 	  const created = await codexMuxRequest("/accounts", {
 		method: "POST",
-		body: JSON.stringify({ label: "" }),
+		body: JSON.stringify({ label: "", temporary }),
 	  });
 	  createdAccountId = created.account.id;
       const result = await codexMuxRequest(`/accounts/${created.account.id}/login`, {
@@ -450,9 +450,11 @@ function CodexMuxAccountMenu() {
             className: "text-token-description-foreground tabular-nums",
             children: remaining == null ? "–" : `${Math.round(remaining)}%`,
           }),
-          children: account.planLabel
-            ? `${account.label} · ${account.planLabel}`
-            : account.label,
+          children: [
+            account.temporary ? "Temporary" : null,
+            account.label,
+            account.planLabel || null,
+          ].filter(Boolean).join(" · "),
         },
         `codex-mux-account-${account.id}`,
       ),
@@ -531,9 +533,22 @@ function CodexMuxAccountMenu() {
         {
           LeftIcon: CodexMuxPlusIcon,
           onSelect: addSubscription,
-          children: busy ? "Adding subscription…" : "Add another subscription",
+          SubText: "Persistent account · Standard pool routing",
+          children: busy ? "Adding subscription…" : "Add regular subscription",
         },
         "codex-mux-add",
+      ),
+    );
+    rows.push(
+      (0, e7.jsx)(
+        _H,
+        {
+          LeftIcon: CodexMuxPlusIcon,
+          onSelect: (event) => addSubscription(event, true),
+          SubText: "Used first · Auto-removed on 429 or terminal authentication failure",
+          children: busy ? "Adding subscription…" : "Add temporary subscription",
+        },
+        "codex-mux-add-temporary",
       ),
     );
   }

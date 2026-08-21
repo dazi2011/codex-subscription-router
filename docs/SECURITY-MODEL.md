@@ -18,7 +18,9 @@ multiplexer reads an account token only to call the same authenticated ChatGPT
 profile and rate-limit-reset endpoints used by the desktop experience. It does
 not log or return tokens. State persisted by the mux contains account paths,
 labels, enabled state, thread ownership, and the concrete model required by a
-thread only.
+thread only. Automatic retirement of a temporary account removes its
+`auth.json` and pool record. Its credential-free rollout history is retained so
+threads already resumed by another child do not lose their backing path.
 
 The state root is mode `0700`; state, config, and control-token files are mode
 `0600`. Existing control tokens are validated as 256-bit hexadecimal values and

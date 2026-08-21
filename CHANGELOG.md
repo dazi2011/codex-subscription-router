@@ -11,6 +11,8 @@ this project uses [Semantic Versioning](https://semver.org/).
   rebuilds, recoverable upgrades, and automatic launch.
 - Reset-aware routing that prioritizes weekly quota at risk of expiring and
   gives a bounded boost to subscriptions with banked usage resets.
+- Temporary subscriptions that route ahead of regular accounts and retire
+  automatically after explicit 429 or terminal authentication failures.
 
 ### Fixed
 

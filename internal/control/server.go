@@ -166,7 +166,8 @@ func (s *Server) accounts(response http.ResponseWriter, request *http.Request) {
 		writeJSON(response, http.StatusOK, map[string]any{"accounts": s.mux.Accounts(ctx)})
 	case http.MethodPost:
 		var input struct {
-			Label string `json:"label"`
+			Label     string `json:"label"`
+			Temporary bool   `json:"temporary"`
 		}
 		if err := decodeJSON(request, &input); err != nil {
 			writeJSON(response, http.StatusBadRequest, map[string]any{"error": err.Error()})
@@ -174,7 +175,7 @@ func (s *Server) accounts(response http.ResponseWriter, request *http.Request) {
 		}
 		ctx, cancel := context.WithTimeout(request.Context(), 20*time.Second)
 		defer cancel()
-		account, err := s.mux.AddAccount(ctx, input.Label)
+		account, err := s.mux.AddAccount(ctx, input.Label, input.Temporary)
 		if err != nil {
 			writeJSON(response, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return

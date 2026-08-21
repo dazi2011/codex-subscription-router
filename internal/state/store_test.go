@@ -376,6 +376,51 @@ func TestManagedConfigDoesNotRewriteUnchangedSecondary(t *testing.T) {
 	}
 }
 
+func TestTemporaryAccountRetirementRemovesCredentialButPreservesHistory(t *testing.T) {
+	root := t.TempDir()
+	primaryHome := filepath.Join(root, "primary")
+	store, err := Open(filepath.Join(root, "mux"), primaryHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	account, err := store.AddTemporaryAccount("Day pass")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !account.Temporary {
+		t.Fatal("temporary account flag was not persisted on creation")
+	}
+	authPath := filepath.Join(account.CodexHome, "auth.json")
+	historyPath := filepath.Join(account.CodexHome, "sessions", "thread.jsonl")
+	if err := os.MkdirAll(filepath.Dir(historyPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(authPath, []byte(`{"tokens":{"access_token":"secret"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(historyPath, []byte("history\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetThreadOwner("thread-1", account.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RetireTemporaryAccount(account.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := store.Account(account.ID); ok {
+		t.Fatal("retired temporary account remained in the pool")
+	}
+	if _, err := os.Stat(authPath); !os.IsNotExist(err) {
+		t.Fatalf("temporary credential was not removed: %v", err)
+	}
+	if contents, err := os.ReadFile(historyPath); err != nil || string(contents) != "history\n" {
+		t.Fatalf("temporary history was not preserved: contents=%q err=%v", contents, err)
+	}
+	if _, ok := store.ThreadOwner("thread-1"); ok {
+		t.Fatal("unmigrated thread retained an owner that no longer exists")
+	}
+}
+
 func TestIsolatedConfigUsesRealTOMLForArraysAndQuotedProjects(t *testing.T) {
 	primary := []byte(`features = [
   "one",
