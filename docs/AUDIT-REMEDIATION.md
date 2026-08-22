@@ -131,8 +131,9 @@ not mean the patched desktop has completed a new signed-app E2E run.
 - **35–41 — release provenance and upstream updates.** A safe default installer
   requires an immutable, reviewed release/tag and an E2E record for this exact
   change. This source checkout must not invent such evidence. The copied app's
-  updater remains disabled because an upstream update would erase or break the
-  version-specific patch.
+  official updater now snapshots the working router and performs fail-closed
+  post-update compatibility analysis, but the first real future-update
+  migration still needs signed-app E2E evidence.
 - **45–50 — absolute capacity and identity compatibility.** The app-server
   provides relative percentages, not a stable absolute quota unit. Automatic
   failover now separates Personal, Business/Team, Enterprise, and Education;
@@ -153,9 +154,9 @@ not mean the patched desktop has completed a new signed-app E2E run.
   Failures remain bounded and neutral where possible, but upstream schema
   changes cannot be prevented locally.
 - **82–87 — patch, signing, TCC, and per-user build identity.** Minified bundle
-  anchors, the diagnostic `--allow-untested-source` escape hatch, ad-hoc
-  signing limitations, independent TCC identity, signing-team continuity, and
-  user-specific output paths are inherent to this patched-app design.
+  anchors, structural-profile drift, ad-hoc signing limitations, signing-team
+  continuity, and user-specific output paths are inherent to this patched-app
+  design.
 
 Before a release, run the source checks and then complete
 [`SMOKE-TEST.md`](SMOKE-TEST.md) against the exact commit. Record the result as

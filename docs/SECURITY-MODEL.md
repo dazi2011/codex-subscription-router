@@ -59,7 +59,7 @@ selected Apple team and verified before replacement. Official OpenAI
 application-group and keychain entitlements are removed from modified callers.
 
 The native helper's caller allowlist is patched to the selected team and the
-independent desktop bundle ID. This is required for the helper's peer checks;
+desktop bundle ID. This is required for the helper's peer checks;
 it does not bypass macOS Accessibility or Screen Recording consent.
 
 ## Diagnostics

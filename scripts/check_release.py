@@ -30,6 +30,7 @@ REQUIRED_FILES = (
     "docs/SMOKE-TEST.md",
     "package-lock.json",
     "package.json",
+    "scripts/update_coordinator.py",
 )
 CURATED_SCREENSHOTS = (
     "screenshots/account-menu.png",
@@ -88,6 +89,8 @@ def main() -> int:
         fail("package.json license does not match LICENSE")
     if not ((ROOT / "install.sh").stat().st_mode & 0o111):
         fail("install.sh is not executable")
+    if not ((ROOT / "scripts/update_coordinator.py").stat().st_mode & 0o111):
+        fail("scripts/update_coordinator.py is not executable")
 
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     dated_heading = rf"^## \[{re.escape(version)}\] - \d{{4}}-\d{{2}}-\d{{2}}$"

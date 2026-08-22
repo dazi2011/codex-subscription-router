@@ -1,11 +1,12 @@
 # Architecture
 
-The independently built desktop uses bundle identifier `app.cdxmux.multi`; its
-Computer Use helper uses `com.cdxmux.sky.CUAService`. Neither identifier is used
-by the official ChatGPT installation. These identifiers and the `.codex-mux`
-state directory remain stable across the product rename so existing macOS
-privacy grants, connected accounts, and sticky thread ownership continue to
-work.
+The independently built desktop retains the official `com.openai.codex` bundle
+identifier so Sparkle can authenticate and install official app-bundle updates.
+Its separate display name, launcher, Chromium user-data directory, URL scheme,
+and signing team isolate runtime state from `/Applications/ChatGPT.app`. The
+Computer Use helper keeps the independent `com.cdxmux.sky.CUAService` identity.
+The `.codex-mux` state directory remains stable so connected accounts and sticky
+thread ownership survive rebuilds.
 
 Codex Subscription Router replaces the copied app's bundled `codex` executable
 with a small Go multiplexer and keeps the original binary beside it as
@@ -126,9 +127,13 @@ changes, and not rewritten when the generated secondary content is identical.
 
 ## Desktop integration
 
-The patcher extracts `app.asar`, verifies exact upstream anchors, inserts the
-account UI, disables self-update, and repacks the archive with an updated
-integrity hash. The app receives a separate Chromium profile and URL scheme.
+The patcher extracts `app.asar`, verifies one complete upstream structural
+profile, inserts the account UI and an update-install preparation hook, and
+repacks the archive with an updated integrity hash. The app receives a separate
+Chromium profile and URL scheme. Sparkle remains enabled. Before an update is
+installed, an external coordinator snapshots the working bundles; after the
+official update it verifies compatibility and either rebuilds the router or
+restores the prior version.
 
 The copied Computer Use service, Node runtime, and callers are re-signed under
 one Apple team. The helper uses a separate bundle identity and socket, avoiding

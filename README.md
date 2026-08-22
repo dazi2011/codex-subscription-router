@@ -88,15 +88,17 @@ Codex Subscription Router currently targets:
 | Component | Supported value |
 | --- | --- |
 | Platform | macOS on Apple silicon |
-| Official ChatGPT version | `26.803.61601` |
-| Official bundle build | `6396` |
+| Official ChatGPT version | `26.818.41509` |
+| Official bundle build | `6962` |
 | Go | 1.26 or newer |
 | Node.js | 22.12 or newer |
 
-The patcher verifies the official version, build, ASAR hash, renderer anchors,
-and native binary constants before changing anything. An unknown upstream build
-is rejected by default rather than being partially patched. See
-[Compatibility](docs/COMPATIBILITY.md) for the recorded hash and test details.
+The patcher verifies the official signature and architecture, then analyzes the
+ASAR renderer anchors, main-process update hook, Computer Use package layout,
+and native binary constants before changing anything. An unknown build is not
+rejected merely for being new: it proceeds only when it matches one complete,
+supported structural profile. See [Compatibility](docs/COMPATIBILITY.md) for
+the recorded hashes and fail-closed conditions.
 
 ## Requirements
 
@@ -254,9 +256,16 @@ the reset is consumed only for that account.
 
 ## Update or rebuild
 
-The copied app's updater is disabled so an official update cannot overwrite the
-patch. Update `/Applications/ChatGPT.app`, verify that the new build is listed
-as compatible, then rebuild:
+The official Sparkle updater remains enabled in the copied app. Before Sparkle
+quits to install, the router snapshots its app and Computer Use helper and
+starts an external migration coordinator. After the authenticated OpenAI update
+lands, the coordinator verifies both the router source and the updated app,
+runs the same structural compatibility analysis, and rebuilds the router. If
+the new build is incompatible, it skips migration and restores the previous
+working router; details remain under `~/.codex-mux/updater/runs/`.
+
+Automatic migration is intentionally tied to the exact clean Git commit used
+for installation. To update the router source itself or rebuild manually:
 
 ```sh
 python3 scripts/patch_app.py --force
@@ -314,6 +323,8 @@ The static-review remediation and remaining evidence boundaries are tracked in
 ## Known limitations
 
 - Upstream ChatGPT updates can require new, reviewed patch anchors.
+- Automatic post-update migration is source/build validated but still needs a
+  signed-app E2E run against an actual future Sparkle release.
 - Quota percentages are not normalized into absolute capacity across Plus,
   Pro, Business, Enterprise, and Edu plans.
 - Personal plans form the explicitly shared Personal pool. Business/Team,
